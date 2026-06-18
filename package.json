@@ -1,0 +1,42 @@
+{
+  "name": "context-bridge-cli",
+  "version": "1.0.0",
+  "description": "Sync Cursor chat context across local projects",
+  "main": "dist/index.js",
+  "bin": {
+    "cb": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "contextbridge.config.example.json"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cursor",
+    "context-sync",
+    "cli",
+    "typescript"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "commander": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

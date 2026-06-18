@@ -1,0 +1,11 @@
+{
+  "from": "C:/Users/your.name/IdeaProjects/service-a",
+  "to": "C:/Users/your.name/IdeaProjects/service-b",
+  "maxMessages": 20,
+  "output": "both",
+  "taskId": "REQ-20260618",
+  "services": ["service-a", "service-b"],
+  "apiInterfaces": ["OrderMarkExpandChangeEvent", "queryReceiverMobileUniqueIds"],
+  "risks": ["数据一致性风险", "跨服务字段对齐风险"],
+  "doctorOutput": "text"
+}
