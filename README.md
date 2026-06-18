@@ -116,3 +116,8 @@ cb bootstrap --config "./contextbridge.config.json"
 npm login
 npm publish
 ```
+
+## 开源协议
+
+本项目采用 `PolyForm Noncommercial 1.0.0` 协议，详见 `LICENSE` 文件。  
+该协议明确**禁止未授权商用**。
