@@ -1,0 +1,24 @@
+README.md
+  s_dcdba5228ca86a::t_7a4fb44643e049 122-123
+  s_dcdba5228ca86a::t_ceb19b02f76619 119-121
+LICENSE
+  s_dcdba5228ca86a::t_3f8c69c3d42b04 1-15
+package.json
+  s_dcdba5228ca86a::t_abe001c070d87d 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "e33c2b034f7a68252f10562ec920bd6cd3f40f4f",
+  "prompts": {},
+  "sessions": {
+    "s_dcdba5228ca86a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6129cb04-16ea-4ce8-bd7f-f71ce4428b1a",
+        "model": "gpt-5.3-codex"
+      },
+      "human_author": "kyrie.guo <kyrie.guo@jtexpress.com>"
+    }
+  }
+}
