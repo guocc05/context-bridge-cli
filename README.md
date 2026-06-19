@@ -30,6 +30,7 @@ cb sync --from "<A项目路径>" --to "<B项目路径>"
 - `--service <name...>`：关联服务（支持多个）
 - `--api <name...>`：关联接口/Topic（支持多个）
 - `--risk <text...>`：风险说明（支持多个）
+- `--to` 支持多个目标路径；若未传且已执行 `task-start --to`，会自动使用任务目标
 
 ```bash
 cb watch --from "<A项目路径>" --to "<B项目路径>" --interval 20 --output both
@@ -83,6 +84,48 @@ cb bootstrap --config "./contextbridge.config.json"
 - `apiInterfaces`（或 `api`）
 - `risks`（或 `risk`）
 - `doctorOutput`
+
+## 任务锚点（增量同步）
+
+为避免“同步到旧对话”，推荐先开启任务锚点：
+
+```bash
+cb task-start --from "<A项目路径>" --to "<B项目路径>" "<C项目路径>" --title "导出新增字段"
+```
+
+查看当前任务：
+
+```bash
+cb task-status
+```
+
+结束任务：
+
+```bash
+cb task-stop
+```
+
+说明：当存在 active task 且 `sync/watch` 的 `--from` 与任务源一致时，只会同步锚点之后新增的内容（增量同步）。
+
+## 服务批量登记
+
+你可以一次性登记某个目录下所有一级子目录（很适合 `IdeaProjects`）：
+
+```bash
+cb services-import --root "C:\Users\kyrie.guo\IdeaProjects"
+```
+
+先预览不落盘：
+
+```bash
+cb services-import --root "C:\Users\kyrie.guo\IdeaProjects" --dry-run
+```
+
+查看已登记服务：
+
+```bash
+cb services-list
+```
 
 ## 输出
 

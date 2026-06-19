@@ -13,7 +13,7 @@ interface ChatMessage {
 
 interface SyncOptions {
   from: string;
-  to: string;
+  toPaths: string[];
   maxMessages: number;
   outputFormat: OutputFormat;
   metadata: SyncMetadata;
@@ -52,6 +52,42 @@ interface BootstrapConfigFile {
   apiInterfaces?: string[];
   risks?: string[];
   doctorOutput?: "text" | "json";
+}
+
+interface ServiceEntry {
+  name: string;
+  path: string;
+  addedAt: string;
+}
+
+interface ServiceRegistry {
+  version: 1;
+  services: ServiceEntry[];
+}
+
+type MarkerKind = "transcript" | "worker-log";
+
+type TaskMarker =
+  | {
+      kind: "transcript";
+      filePath: string;
+      lineOffset: number;
+    }
+  | {
+      kind: "worker-log";
+      filePath: string;
+      byteOffset: number;
+    };
+
+interface TaskState {
+  version: 1;
+  taskId: string;
+  title: string;
+  from: string;
+  targets: string[];
+  startedAt: string;
+  lastSyncedAt?: string;
+  marker: TaskMarker;
 }
 
 type OutputFormat = "markdown" | "json" | "both";
@@ -118,7 +154,7 @@ program
   .command("sync")
   .description("Sync latest conversation summary from project A to project B")
   .requiredOption("--from <path>", "source project path (A)")
-  .requiredOption("--to <path>", "target project path (B)")
+  .option("--to <paths...>", "target project paths (B/C/...)")
   .option("--max-messages <number>", "max recent messages to summarize", "16")
   .option("--output <format>", "output format: markdown | json | both", "markdown")
   .option("--task-id <id>", "task id for cross-project tracking")
@@ -128,7 +164,7 @@ program
   .action(
     (opts: {
       from: string;
-      to: string;
+      to?: string[];
       maxMessages: string;
       output: string;
       taskId?: string;
@@ -138,7 +174,7 @@ program
     }) => {
     const normalized: SyncOptions = {
       from: resolvePath(opts.from),
-      to: resolvePath(opts.to),
+      toPaths: (opts.to ?? []).map((p) => resolvePath(p)),
       maxMessages: normalizeMaxMessages(opts.maxMessages),
       outputFormat: normalizeOutputFormat(opts.output),
       metadata: normalizeMetadata({
@@ -157,7 +193,7 @@ program
   .command("watch")
   .description("Watch project A and auto-sync summary to project B")
   .requiredOption("--from <path>", "source project path (A)")
-  .requiredOption("--to <path>", "target project path (B)")
+  .option("--to <paths...>", "target project paths (B/C/...)")
   .option("--max-messages <number>", "max recent messages to summarize", "16")
   .option("--interval <seconds>", "watch interval seconds", "20")
   .option("--output <format>", "output format: markdown | json | both", "markdown")
@@ -168,7 +204,7 @@ program
   .action(
     (opts: {
       from: string;
-      to: string;
+      to?: string[];
       maxMessages: string;
       interval: string;
       output: string;
@@ -179,7 +215,7 @@ program
     }) => {
       const normalized: WatchOptions = {
         from: resolvePath(opts.from),
-        to: resolvePath(opts.to),
+        toPaths: (opts.to ?? []).map((p) => resolvePath(p)),
         maxMessages: normalizeMaxMessages(opts.maxMessages),
         intervalSec: normalizeInterval(opts.interval),
         outputFormat: normalizeOutputFormat(opts.output),
@@ -289,7 +325,7 @@ program
 
       const normalized: BootstrapOptions = {
         from: fromPath,
-        to: toPath,
+        toPaths: [toPath],
         maxMessages,
         outputFormat,
         metadata: normalizeMetadata({
@@ -304,63 +340,195 @@ program
     },
   );
 
+program
+  .command("services-import")
+  .description("Register all first-level project folders as services")
+  .requiredOption("--root <path>", "root directory, e.g. C:/Users/name/IdeaProjects")
+  .option("--dry-run", "preview without writing registry", false)
+  .action((opts: { root: string; dryRun?: boolean }) => {
+    runServicesImport({
+      root: resolvePath(opts.root),
+      dryRun: Boolean(opts.dryRun),
+    });
+  });
+
+program
+  .command("services-list")
+  .description("List registered services")
+  .action(() => {
+    runServicesList();
+  });
+
+program
+  .command("task-start")
+  .description("Start a task and set incremental sync marker")
+  .requiredOption("--from <path>", "source project path (A)")
+  .option("--to <paths...>", "default target project paths for this task")
+  .requiredOption("--title <text>", "task title")
+  .option("--task-id <id>", "task id; auto-generated if omitted")
+  .action((opts: { from: string; to?: string[]; title: string; taskId?: string }) => {
+    runTaskStart({
+      from: resolvePath(opts.from),
+      targets: (opts.to ?? []).map((p) => resolvePath(p)),
+      title: opts.title,
+      taskId: opts.taskId,
+    });
+  });
+
+program
+  .command("task-stop")
+  .description("Stop current active task")
+  .action(() => {
+    runTaskStop();
+  });
+
+program
+  .command("task-status")
+  .description("Show current active task status")
+  .action(() => {
+    runTaskStatus();
+  });
+
 program.parse();
 
 function runSync(options: SyncOptions): void {
   ensureDirectory(options.from, "source project");
-  ensureDirectory(options.to, "target project");
+  const normalizedFrom = normalizeWorkspacePath(options.from);
+  const activeTask = readCurrentTask();
+  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask);
+  for (const target of effectiveTargets) {
+    ensureDirectory(target, "target project");
+  }
+  const effectiveMetadata: SyncMetadata = {
+    ...options.metadata,
+    taskId: options.metadata.taskId ?? activeTask?.taskId,
+  };
 
-  const snapshot = loadSourceSnapshot(options.from, options.maxMessages);
+  let snapshot: SourceSnapshot;
+  if (activeTask && activeTask.from === normalizedFrom) {
+    const incremental = loadSourceSnapshotByMarker(
+      options.from,
+      options.maxMessages,
+      activeTask.marker,
+    );
+    if (incremental.messages.length === 0) {
+      console.log(`No new messages since marker for task ${activeTask.taskId}.`);
+      return;
+    }
+    snapshot = {
+      sourceType: incremental.marker.kind,
+      sourceFile: incremental.marker.filePath,
+      sourceSignature: `${incremental.marker.kind}:${incremental.marker.filePath}`,
+      messages: incremental.messages,
+    };
+    activeTask.marker = incremental.marker;
+    activeTask.lastSyncedAt = new Date().toISOString();
+    writeCurrentTask(activeTask);
+  } else {
+    snapshot = loadSourceSnapshot(options.from, options.maxMessages);
+  }
+
   const result = writeSummaryFiles({
     sourceProject: options.from,
-    targetProject: options.to,
+    targetProject: effectiveTargets[0],
     snapshot,
     maxMessages: options.maxMessages,
     outputFormat: options.outputFormat,
-    metadata: options.metadata,
+    metadata: effectiveMetadata,
   });
 
   console.log("Sync completed.");
   console.log(`Source type: ${snapshot.sourceType}`);
   console.log(`Source file: ${snapshot.sourceFile}`);
-  for (const filePath of result.generatedPaths) {
-    console.log(`Generated: ${filePath}`);
+  console.log(`Targets: ${effectiveTargets.join(", ")}`);
+  for (const target of effectiveTargets) {
+    const targetResult =
+      target === effectiveTargets[0]
+        ? result
+        : writeSummaryFiles({
+            sourceProject: options.from,
+            targetProject: target,
+            snapshot,
+            maxMessages: options.maxMessages,
+            outputFormat: options.outputFormat,
+            metadata: effectiveMetadata,
+          });
+    for (const filePath of targetResult.generatedPaths) {
+      console.log(`Generated: ${filePath}`);
+    }
   }
 }
 
 function runWatch(options: WatchOptions): void {
   ensureDirectory(options.from, "source project");
-  ensureDirectory(options.to, "target project");
+  const normalizedFrom = normalizeWorkspacePath(options.from);
+  const activeTask = readCurrentTask();
+  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask);
+  for (const target of effectiveTargets) {
+    ensureDirectory(target, "target project");
+  }
 
   console.log(
     `Watching source project changes every ${options.intervalSec}s...`,
   );
   console.log(`From: ${options.from}`);
-  console.log(`To: ${options.to}`);
+  console.log(`To: ${effectiveTargets.join(", ")}`);
 
   let previousSignature = "";
 
   const tick = (): void => {
     try {
-      const snapshot = loadSourceSnapshot(options.from, options.maxMessages);
-      if (snapshot.sourceSignature === previousSignature) {
-        console.log(`[${new Date().toLocaleTimeString()}] No changes detected.`);
-        return;
+      const activeTask = readCurrentTask();
+      const effectiveMetadata: SyncMetadata = {
+        ...options.metadata,
+        taskId: options.metadata.taskId ?? activeTask?.taskId,
+      };
+
+      let snapshot: SourceSnapshot;
+      if (activeTask && activeTask.from === normalizedFrom) {
+        const incremental = loadSourceSnapshotByMarker(
+          options.from,
+          options.maxMessages,
+          activeTask.marker,
+        );
+        if (incremental.messages.length === 0) {
+          console.log(`[${new Date().toLocaleTimeString()}] No changes detected.`);
+          return;
+        }
+        snapshot = {
+          sourceType: incremental.marker.kind,
+          sourceFile: incremental.marker.filePath,
+          sourceSignature: `${incremental.marker.kind}:${incremental.marker.filePath}:${Date.now()}`,
+          messages: incremental.messages,
+        };
+        activeTask.marker = incremental.marker;
+        activeTask.lastSyncedAt = new Date().toISOString();
+        writeCurrentTask(activeTask);
+      } else {
+        snapshot = loadSourceSnapshot(options.from, options.maxMessages);
+        if (snapshot.sourceSignature === previousSignature) {
+          console.log(`[${new Date().toLocaleTimeString()}] No changes detected.`);
+          return;
+        }
       }
 
-      const result = writeSummaryFiles({
-        sourceProject: options.from,
-        targetProject: options.to,
-        snapshot,
-        maxMessages: options.maxMessages,
-        outputFormat: options.outputFormat,
-        metadata: options.metadata,
-      });
+      const outputs: string[] = [];
+      for (const target of effectiveTargets) {
+        const result = writeSummaryFiles({
+          sourceProject: options.from,
+          targetProject: target,
+          snapshot,
+          maxMessages: options.maxMessages,
+          outputFormat: options.outputFormat,
+          metadata: effectiveMetadata,
+        });
+        outputs.push(...result.generatedPaths);
+      }
       previousSignature = snapshot.sourceSignature;
 
       console.log(`[${new Date().toLocaleTimeString()}] Synced successfully.`);
       console.log(`  Source: ${snapshot.sourceType} ${snapshot.sourceFile}`);
-      for (const filePath of result.generatedPaths) {
+      for (const filePath of outputs) {
         console.log(`  Output: ${filePath}`);
       }
     } catch (error) {
@@ -542,17 +710,24 @@ function runDoctor(options: DoctorOptions): void {
 }
 
 function runBootstrap(options: BootstrapOptions): void {
+  const bootstrapTargets = options.toPaths;
+  if (bootstrapTargets.length === 0) {
+    throw new Error("Bootstrap requires at least one target project.");
+  }
+
   console.log("Bootstrap started.");
   console.log("");
 
   console.log("[1/3] Initializing target project...");
-  runInit({ target: options.to });
+  for (const target of bootstrapTargets) {
+    runInit({ target });
+  }
   console.log("");
 
   console.log("[2/3] Syncing context...");
   runSync({
     from: options.from,
-    to: options.to,
+    toPaths: options.toPaths,
     maxMessages: options.maxMessages,
     outputFormat: options.outputFormat,
     metadata: options.metadata,
@@ -561,12 +736,159 @@ function runBootstrap(options: BootstrapOptions): void {
 
   console.log("[3/3] Running doctor diagnostics...");
   runDoctor({
-    projects: [options.from, options.to],
+    projects: [options.from, ...bootstrapTargets],
     outputFormat: options.doctorOutput,
   });
   console.log("");
 
   console.log("Bootstrap completed.");
+}
+
+function runServicesImport(options: { root: string; dryRun: boolean }): void {
+  ensureDirectory(options.root, "services root");
+
+  const entries = fs
+    .readdirSync(options.root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .filter((entry) => !entry.name.startsWith("."))
+    .map((entry) => ({
+      name: entry.name,
+      path: path.join(options.root, entry.name),
+      addedAt: new Date().toISOString(),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const registry = readServiceRegistry();
+  let added = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (const item of entries) {
+    const byNameIndex = registry.services.findIndex((s) => s.name === item.name);
+    const samePathExists = registry.services.some((s) => s.path === item.path);
+
+    if (byNameIndex >= 0) {
+      if (registry.services[byNameIndex].path === item.path) {
+        skipped += 1;
+      } else {
+        registry.services[byNameIndex] = item;
+        updated += 1;
+      }
+      continue;
+    }
+
+    if (samePathExists) {
+      skipped += 1;
+      continue;
+    }
+
+    registry.services.push(item);
+    added += 1;
+  }
+
+  registry.services.sort((a, b) => a.name.localeCompare(b.name));
+
+  if (!options.dryRun) {
+    writeServiceRegistry(registry);
+  }
+
+  console.log(options.dryRun ? "Services import preview completed." : "Services import completed.");
+  console.log(`Root: ${options.root}`);
+  console.log(`Detected folders: ${entries.length}`);
+  console.log(`Added: ${added}, Updated: ${updated}, Skipped: ${skipped}`);
+  console.log(`Registry: ${resolveServiceRegistryPath()}`);
+}
+
+function runServicesList(): void {
+  const registry = readServiceRegistry();
+  if (registry.services.length === 0) {
+    console.log("No registered services.");
+    console.log(`Registry: ${resolveServiceRegistryPath()}`);
+    return;
+  }
+
+  console.log(`Registered services (${registry.services.length}):`);
+  for (const svc of registry.services) {
+    console.log(`- ${svc.name}: ${svc.path}`);
+  }
+}
+
+function runTaskStart(options: {
+  from: string;
+  targets: string[];
+  title: string;
+  taskId?: string;
+}): void {
+  ensureDirectory(options.from, "source project");
+  const normalizedFrom = normalizeWorkspacePath(options.from);
+  const normalizedTargets = options.targets.map((p) => normalizeWorkspacePath(p));
+  for (const target of normalizedTargets) {
+    ensureDirectory(target, "target project");
+  }
+  const marker = createTaskMarker(normalizedFrom);
+  const task: TaskState = {
+    version: 1,
+    taskId: options.taskId?.trim() || generateTaskId(),
+    title: options.title.trim(),
+    from: normalizedFrom,
+    targets: dedupeLines(normalizedTargets),
+    startedAt: new Date().toISOString(),
+    marker,
+  };
+
+  writeCurrentTask(task);
+
+  console.log("Task started.");
+  console.log(`Task ID: ${task.taskId}`);
+  console.log(`Title: ${task.title}`);
+  console.log(`From: ${task.from}`);
+  if (task.targets.length > 0) {
+    console.log(`Targets: ${task.targets.join(", ")}`);
+  }
+  console.log(`Marker: ${task.marker.kind} ${task.marker.filePath}`);
+}
+
+function runTaskStop(): void {
+  const task = readCurrentTask();
+  if (!task) {
+    console.log("No active task.");
+    return;
+  }
+
+  archiveTask(task);
+  clearCurrentTask();
+
+  console.log("Task stopped.");
+  console.log(`Task ID: ${task.taskId}`);
+}
+
+function runTaskStatus(): void {
+  const task = readCurrentTask();
+  if (!task) {
+    console.log("No active task.");
+    return;
+  }
+
+  console.log("Active task:");
+  console.log(`- Task ID: ${task.taskId}`);
+  console.log(`- Title: ${task.title}`);
+  console.log(`- From: ${task.from}`);
+  if (task.targets.length > 0) {
+    console.log(`- Targets: ${task.targets.join(", ")}`);
+  }
+  console.log(`- Started: ${task.startedAt}`);
+  if (task.lastSyncedAt) {
+    console.log(`- Last Synced: ${task.lastSyncedAt}`);
+  }
+  if (task.marker.kind === "transcript") {
+    console.log(
+      `- Marker: transcript ${task.marker.filePath} @line ${task.marker.lineOffset}`,
+    );
+  } else {
+    console.log(
+      `- Marker: worker-log ${task.marker.filePath} @byte ${task.marker.byteOffset}`,
+    );
+  }
 }
 
 function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSnapshot {
@@ -602,6 +924,133 @@ function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSna
   throw new Error(
     `No readable source found. Tried transcript dir: ${transcriptDir}, worker log: ${workerLogFile ?? "N/A"}`,
   );
+}
+
+function loadSourceSnapshotByMarker(
+  projectPath: string,
+  maxMessages: number,
+  marker: TaskMarker,
+): { messages: ChatMessage[]; marker: TaskMarker } {
+  if (marker.kind === "transcript") {
+    const next = loadTranscriptIncremental(projectPath, marker);
+    return {
+      messages: next.messages.slice(-Math.max(maxMessages * 4, maxMessages)),
+      marker: next.marker,
+    };
+  }
+
+  const next = loadWorkerLogIncremental(projectPath, marker);
+  return {
+    messages: next.messages.slice(-Math.max(maxMessages * 4, maxMessages)),
+    marker: next.marker,
+  };
+}
+
+function loadTranscriptIncremental(
+  projectPath: string,
+  marker: Extract<TaskMarker, { kind: "transcript" }>,
+): { messages: ChatMessage[]; marker: TaskMarker } {
+  const transcriptDir = resolveTranscriptDir(projectPath);
+  if (!fs.existsSync(transcriptDir) || !fs.statSync(transcriptDir).isDirectory()) {
+    return { messages: [], marker };
+  }
+
+  const files = fs
+    .readdirSync(transcriptDir)
+    .filter((name) => name.endsWith(".jsonl"))
+    .map((name) => path.join(transcriptDir, name))
+    .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs);
+
+  if (files.length === 0) {
+    return { messages: [], marker };
+  }
+
+  let startIndex = files.findIndex(
+    (filePath) => normalizeWorkspacePath(filePath) === normalizeWorkspacePath(marker.filePath),
+  );
+
+  if (startIndex < 0) {
+    const refreshed = createTaskMarker(normalizeWorkspacePath(projectPath));
+    return { messages: [], marker: refreshed };
+  }
+
+  const allMessages: ChatMessage[] = [];
+  let nextMarker: TaskMarker = marker;
+  for (let i = startIndex; i < files.length; i += 1) {
+    const filePath = files[i];
+    const rawLines = readRawLines(filePath);
+    const startLine = i === startIndex ? marker.lineOffset : 0;
+    const newLines = rawLines.slice(Math.max(startLine, 0));
+    allMessages.push(...parseTranscriptLines(newLines));
+    nextMarker = {
+      kind: "transcript",
+      filePath,
+      lineOffset: rawLines.length,
+    };
+  }
+
+  return { messages: allMessages, marker: nextMarker };
+}
+
+function loadWorkerLogIncremental(
+  projectPath: string,
+  marker: Extract<TaskMarker, { kind: "worker-log" }>,
+): { messages: ChatMessage[]; marker: TaskMarker } {
+  const workerLogFile = resolveWorkerLogFile(projectPath);
+  if (!fs.existsSync(workerLogFile) || !fs.statSync(workerLogFile).isFile()) {
+    return { messages: [], marker };
+  }
+
+  const stat = fs.statSync(workerLogFile);
+  const currentSize = stat.size;
+  const safeOffset = Math.max(0, Math.min(marker.byteOffset, currentSize));
+  if (currentSize <= safeOffset) {
+    return {
+      messages: [],
+      marker: {
+        kind: "worker-log",
+        filePath: workerLogFile,
+        byteOffset: currentSize,
+      },
+    };
+  }
+
+  const buffer = fs.readFileSync(workerLogFile);
+  const chunk = buffer.subarray(safeOffset).toString("utf8");
+  const messages = parseWorkerLogContent(chunk);
+
+  return {
+    messages,
+    marker: {
+      kind: "worker-log",
+      filePath: workerLogFile,
+      byteOffset: currentSize,
+    },
+  };
+}
+
+function createTaskMarker(normalizedProjectPath: string): TaskMarker {
+  const transcriptDir = resolveTranscriptDir(normalizedProjectPath);
+  const latestTranscript = pickLatestTranscriptFile(transcriptDir);
+  if (latestTranscript) {
+    const lines = readRawLines(latestTranscript);
+    return {
+      kind: "transcript",
+      filePath: latestTranscript,
+      lineOffset: lines.length,
+    };
+  }
+
+  const workerLogFile = resolveWorkerLogFile(normalizedProjectPath);
+  const size =
+    fs.existsSync(workerLogFile) && fs.statSync(workerLogFile).isFile()
+      ? fs.statSync(workerLogFile).size
+      : 0;
+  return {
+    kind: "worker-log",
+    filePath: workerLogFile,
+    byteOffset: size,
+  };
 }
 
 function resolveCursorProjectDir(projectPath: string): string {
@@ -674,11 +1123,13 @@ function pickLatestTranscriptFile(transcriptDir: string): string | null {
 }
 
 function parseTranscript(filePath: string): ChatMessage[] {
-  const raw = fs.readFileSync(filePath, "utf8");
-  const lines = raw.split(/\r?\n/).filter(Boolean);
+  return parseTranscriptLines(readRawLines(filePath));
+}
+
+function parseTranscriptLines(lines: string[]): ChatMessage[] {
   const output: ChatMessage[] = [];
 
-  for (const line of lines) {
+  for (const line of lines.filter(Boolean)) {
     try {
       const parsed = JSON.parse(line) as unknown;
       const role = detectRole(parsed);
@@ -693,14 +1144,16 @@ function parseTranscript(filePath: string): ChatMessage[] {
       continue;
     }
   }
-
   return output;
 }
 
 function parseWorkerLog(filePath: string, maxLines: number): ChatMessage[] {
-  const raw = fs.readFileSync(filePath, "utf8");
-  const lines = raw.split(/\r?\n/);
+  const messages = parseWorkerLogContent(fs.readFileSync(filePath, "utf8"));
+  return messages.slice(-Math.max(maxLines, 1));
+}
 
+function parseWorkerLogContent(content: string): ChatMessage[] {
+  const lines = content.split(/\r?\n/);
   const meaningful: string[] = [];
   for (const line of lines) {
     const parsed = pickWorkerLogLine(line);
@@ -708,11 +1161,11 @@ function parseWorkerLog(filePath: string, maxLines: number): ChatMessage[] {
       meaningful.push(parsed);
     }
   }
+  return meaningful.map((line) => ({ role: "assistant", text: line }));
+}
 
-  return meaningful.slice(-Math.max(maxLines, 1)).map((line) => ({
-    role: "assistant",
-    text: line,
-  }));
+function readRawLines(filePath: string): string[] {
+  return fs.readFileSync(filePath, "utf8").split(/\r?\n/);
 }
 
 function pickWorkerLogLine(line: string): string | null {
@@ -1082,6 +1535,21 @@ function normalizeMetadata(input: {
   };
 }
 
+function resolveSyncTargets(
+  cliTargets: string[],
+  activeTask: TaskState | null,
+): string[] {
+  const normalizedCliTargets = dedupeLines(cliTargets.map((p) => normalizeWorkspacePath(p)));
+  if (normalizedCliTargets.length > 0) {
+    return normalizedCliTargets;
+  }
+  const taskTargets = activeTask?.targets ?? [];
+  if (taskTargets.length > 0) {
+    return dedupeLines(taskTargets.map((p) => normalizeWorkspacePath(p)));
+  }
+  throw new Error("No target project provided. Use --to or set targets in task-start.");
+}
+
 function resolvePath(inputPath: string): string {
   return path.resolve(inputPath);
 }
@@ -1246,6 +1714,175 @@ function buildExportMarkdown(data: {
   }
 
   return lines.join("\n");
+}
+
+function resolveServiceRegistryPath(): string {
+  return path.join(getUserHomeDir(), ".contextbridge", "services.json");
+}
+
+function readServiceRegistry(): ServiceRegistry {
+  const registryPath = resolveServiceRegistryPath();
+  if (!fs.existsSync(registryPath)) {
+    return { version: 1, services: [] };
+  }
+
+  try {
+    const raw = fs.readFileSync(registryPath, "utf8").replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return { version: 1, services: [] };
+    }
+
+    const obj = parsed as Record<string, unknown>;
+    const servicesRaw = Array.isArray(obj.services) ? obj.services : [];
+    const services: ServiceEntry[] = servicesRaw
+      .map((item) => {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        const s = item as Record<string, unknown>;
+        if (typeof s.name !== "string" || typeof s.path !== "string") {
+          return null;
+        }
+        return {
+          name: s.name.trim(),
+          path: s.path.trim(),
+          addedAt:
+            typeof s.addedAt === "string" && s.addedAt.trim()
+              ? s.addedAt
+              : new Date().toISOString(),
+        };
+      })
+      .filter((v): v is ServiceEntry => Boolean(v && v.name && v.path));
+
+    return { version: 1, services };
+  } catch {
+    return { version: 1, services: [] };
+  }
+}
+
+function writeServiceRegistry(registry: ServiceRegistry): void {
+  const registryPath = resolveServiceRegistryPath();
+  const dir = path.dirname(registryPath);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2), "utf8");
+}
+
+function resolveTaskRootDir(): string {
+  return path.join(getUserHomeDir(), ".contextbridge", "tasks");
+}
+
+function resolveCurrentTaskPath(): string {
+  return path.join(resolveTaskRootDir(), "current-task.json");
+}
+
+function resolveTaskArchiveDir(): string {
+  return path.join(resolveTaskRootDir(), "history");
+}
+
+function readCurrentTask(): TaskState | null {
+  const taskPath = resolveCurrentTaskPath();
+  if (!fs.existsSync(taskPath) || !fs.statSync(taskPath).isFile()) {
+    return null;
+  }
+
+  try {
+    const raw = fs.readFileSync(taskPath, "utf8").replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    const obj = parsed as Record<string, unknown>;
+    if (
+      typeof obj.taskId !== "string" ||
+      typeof obj.title !== "string" ||
+      typeof obj.from !== "string" ||
+      typeof obj.startedAt !== "string" ||
+      !obj.marker ||
+      typeof obj.marker !== "object"
+    ) {
+      return null;
+    }
+    const markerObj = obj.marker as Record<string, unknown>;
+    let marker: TaskMarker | null = null;
+    if (
+      markerObj.kind === "transcript" &&
+      typeof markerObj.filePath === "string" &&
+      typeof markerObj.lineOffset === "number"
+    ) {
+      marker = {
+        kind: "transcript",
+        filePath: markerObj.filePath,
+        lineOffset: Math.max(0, Math.trunc(markerObj.lineOffset)),
+      };
+    } else if (
+      markerObj.kind === "worker-log" &&
+      typeof markerObj.filePath === "string" &&
+      typeof markerObj.byteOffset === "number"
+    ) {
+      marker = {
+        kind: "worker-log",
+        filePath: markerObj.filePath,
+        byteOffset: Math.max(0, Math.trunc(markerObj.byteOffset)),
+      };
+    }
+    if (!marker) {
+      return null;
+    }
+
+    return {
+      version: 1,
+      taskId: obj.taskId,
+      title: obj.title,
+      from: obj.from,
+      targets: Array.isArray(obj.targets)
+        ? obj.targets
+            .filter((item): item is string => typeof item === "string")
+            .map((item) => item.trim())
+            .filter((item) => Boolean(item))
+        : [],
+      startedAt: obj.startedAt,
+      lastSyncedAt:
+        typeof obj.lastSyncedAt === "string" ? obj.lastSyncedAt : undefined,
+      marker,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCurrentTask(task: TaskState): void {
+  const taskPath = resolveCurrentTaskPath();
+  fs.mkdirSync(path.dirname(taskPath), { recursive: true });
+  fs.writeFileSync(taskPath, JSON.stringify(task, null, 2), "utf8");
+}
+
+function clearCurrentTask(): void {
+  const taskPath = resolveCurrentTaskPath();
+  if (fs.existsSync(taskPath)) {
+    fs.rmSync(taskPath, { force: true });
+  }
+}
+
+function archiveTask(task: TaskState): void {
+  const archiveDir = resolveTaskArchiveDir();
+  fs.mkdirSync(archiveDir, { recursive: true });
+  const safeId = task.taskId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const archivePath = path.join(
+    archiveDir,
+    `${safeId}-${formatDate(new Date())}.json`,
+  );
+  fs.writeFileSync(archivePath, JSON.stringify(task, null, 2), "utf8");
+}
+
+function generateTaskId(): string {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  return `TASK-${yyyy}${mm}${dd}-${hh}${mi}`;
 }
 
 function writeSummaryFiles(input: {
