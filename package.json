@@ -32,9 +32,12 @@
     "access": "public"
   },
   "dependencies": {
-    "commander": "^14.0.2"
+    "commander": "^14.0.2",
+    "inquirer": "^8.2.7",
+    "picocolors": "^1.1.1"
   },
   "devDependencies": {
+    "@types/inquirer": "^9.0.10",
     "@types/node": "^25.9.3",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"

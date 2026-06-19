@@ -3,6 +3,8 @@
 import fs from "fs";
 import path from "path";
 import { Command } from "commander";
+import inquirer from "inquirer";
+import pc from "picocolors";
 
 type ChatRole = "user" | "assistant" | "system" | "unknown";
 
@@ -143,6 +145,54 @@ interface SourceSnapshot {
   messages: ChatMessage[];
 }
 
+// ============================================================================
+// 输出辅助函数
+// ============================================================================
+
+const output = {
+  success: (msg: string) => console.log(pc.green("✓"), msg),
+  error: (msg: string) => console.error(pc.red("✗"), msg),
+  warning: (msg: string) => console.log(pc.yellow("⚠"), msg),
+  info: (msg: string) => console.log(pc.blue("ℹ"), msg),
+  title: (msg: string) => console.log(pc.bold(pc.cyan(msg))),
+  dim: (msg: string) => console.log(pc.dim(msg)),
+  section: (label: string, value: string) =>
+    console.log(`  ${pc.dim(label)}: ${value}`),
+  divider: () => console.log(pc.dim("━".repeat(40))),
+};
+
+function printErrorWithRecovery(message: string, suggestions: string[]): void {
+  output.error(message);
+  if (suggestions.length > 0) {
+    console.log(pc.dim("\n💡 建议:"));
+    suggestions.forEach((s) => console.log(pc.dim(`  • ${s}`)));
+  }
+}
+
+function getProjectDisplayName(projectPath: string): string {
+  const registry = readServiceRegistry();
+  const service = registry.services.find((s) => s.path === projectPath);
+  if (service) {
+    return service.name;
+  }
+  return path.basename(projectPath);
+}
+
+function formatTimestamp(isoString: string): string {
+  const date = new Date(isoString);
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// ============================================================================
+// CLI 定义
+// ============================================================================
+
 const program = new Command();
 
 program
@@ -153,8 +203,8 @@ program
 program
   .command("sync")
   .description("Sync latest conversation summary from project A to project B")
-  .requiredOption("--from <path>", "source project path (A)")
-  .option("--to <paths...>", "target project paths (B/C/...)")
+  .option("--from <path>", "source project path or service name (default: current directory)")
+  .option("--to <paths...>", "target project paths or service names (B/C/...)")
   .option("--max-messages <number>", "max recent messages to summarize", "16")
   .option("--output <format>", "output format: markdown | json | both", "markdown")
   .option("--task-id <id>", "task id for cross-project tracking")
@@ -163,7 +213,7 @@ program
   .option("--risk <text...>", "known risks")
   .action(
     (opts: {
-      from: string;
+      from?: string;
       to?: string[];
       maxMessages: string;
       output: string;
@@ -172,28 +222,40 @@ program
       api?: string[];
       risk?: string[];
     }) => {
-    const normalized: SyncOptions = {
-      from: resolvePath(opts.from),
-      toPaths: (opts.to ?? []).map((p) => resolvePath(p)),
-      maxMessages: normalizeMaxMessages(opts.maxMessages),
-      outputFormat: normalizeOutputFormat(opts.output),
-      metadata: normalizeMetadata({
-        taskId: opts.taskId,
-        services: opts.service,
-        apiInterfaces: opts.api,
-        risks: opts.risk,
-      }),
-    };
+      // 自动检测源项目：优先级 from参数 > 活跃任务 > 当前目录
+      const activeTask = readCurrentTask();
+      let fromPath: string;
 
-    runSync(normalized);
+      if (opts.from) {
+        fromPath = resolveProjectPath(opts.from);
+      } else if (activeTask) {
+        fromPath = activeTask.from;
+      } else {
+        fromPath = process.cwd();
+      }
+
+      const normalized: SyncOptions = {
+        from: fromPath,
+        toPaths: (opts.to ?? []).map((p) => resolveProjectPath(p)),
+        maxMessages: normalizeMaxMessages(opts.maxMessages),
+        outputFormat: normalizeOutputFormat(opts.output),
+        metadata: normalizeMetadata({
+          taskId: opts.taskId,
+          services: opts.service,
+          apiInterfaces: opts.api,
+          risks: opts.risk,
+        }),
+      };
+
+      runSync(normalized);
     },
   );
 
 program
   .command("watch")
-  .description("Watch project A and auto-sync summary to project B")
-  .requiredOption("--from <path>", "source project path (A)")
-  .option("--to <paths...>", "target project paths (B/C/...)")
+  .description("Watch source project and auto-sync summary to target project")
+  .option("--from <path>", "source project path or service name (default: current directory or task source)")
+  .option("--to <paths...>", "target project paths or service names (default: task targets)")
   .option("--max-messages <number>", "max recent messages to summarize", "16")
   .option("--interval <seconds>", "watch interval seconds", "20")
   .option("--output <format>", "output format: markdown | json | both", "markdown")
@@ -203,7 +265,7 @@ program
   .option("--risk <text...>", "known risks")
   .action(
     (opts: {
-      from: string;
+      from?: string;
       to?: string[];
       maxMessages: string;
       interval: string;
@@ -213,9 +275,21 @@ program
       api?: string[];
       risk?: string[];
     }) => {
+      // 自动检测源项目：优先级 from参数 > 活跃任务 > 当前目录
+      const activeTask = readCurrentTask();
+      let fromPath: string;
+
+      if (opts.from) {
+        fromPath = resolveProjectPath(opts.from);
+      } else if (activeTask) {
+        fromPath = activeTask.from;
+      } else {
+        fromPath = process.cwd();
+      }
+
       const normalized: WatchOptions = {
-        from: resolvePath(opts.from),
-        toPaths: (opts.to ?? []).map((p) => resolvePath(p)),
+        from: fromPath,
+        toPaths: (opts.to ?? []).map((p) => resolveProjectPath(p)),
         maxMessages: normalizeMaxMessages(opts.maxMessages),
         intervalSec: normalizeInterval(opts.interval),
         outputFormat: normalizeOutputFormat(opts.output),
@@ -234,10 +308,10 @@ program
 program
   .command("init")
   .description("Initialize ContextBridge files in target project")
-  .requiredOption("--target <path>", "target project path")
+  .requiredOption("--target <path>", "target project path or service name")
   .action((opts: { target: string }) => {
     const normalized: InitOptions = {
-      target: resolvePath(opts.target),
+      target: resolveProjectPath(opts.target),
     };
     runInit(normalized);
   });
@@ -245,7 +319,7 @@ program
 program
   .command("export")
   .description("Export latest summaries from multiple projects")
-  .requiredOption("--projects <paths...>", "project paths to aggregate")
+  .requiredOption("--projects <paths...>", "project paths or service names to aggregate")
   .requiredOption("--out <path>", "output file path without extension")
   .option("--format <format>", "output format: json | markdown | both", "both")
   .action(
@@ -255,8 +329,8 @@ program
       format: string;
     }) => {
       const normalized: ExportOptions = {
-        projects: opts.projects.map((p) => resolvePath(p)),
-        out: resolvePath(opts.out),
+        projects: opts.projects.map((p) => resolveProjectPath(p)),
+        out: resolveProjectPath(opts.out),
         format: normalizeExportFormat(opts.format),
       };
       runExport(normalized);
@@ -266,7 +340,7 @@ program
 program
   .command("doctor")
   .description("Diagnose local Cursor context availability")
-  .requiredOption("--projects <paths...>", "project paths to check")
+  .requiredOption("--projects <paths...>", "project paths or service names to check")
   .option("--output <format>", "output format: text | json", "text")
   .action(
     (opts: {
@@ -274,7 +348,7 @@ program
       output: string;
     }) => {
       const normalized: DoctorOptions = {
-        projects: opts.projects.map((p) => resolvePath(p)),
+        projects: opts.projects.map((p) => resolveProjectPath(p)),
         outputFormat: normalizeDoctorOutput(opts.output),
       };
       runDoctor(normalized);
@@ -285,8 +359,8 @@ program
   .command("bootstrap")
   .description("Run init + sync + doctor in one command")
   .option("--config <path>", "bootstrap config file path (JSON)")
-  .option("--from <path>", "source project path (A)")
-  .option("--to <path>", "target project path (B)")
+  .option("--from <path>", "source project path or service name (A)")
+  .option("--to <path>", "target project path or service name (B)")
   .option("--max-messages <number>", "max recent messages to summarize")
   .option("--output <format>", "output format: markdown | json | both")
   .option("--task-id <id>", "task id for cross-project tracking")
@@ -311,8 +385,8 @@ program
         ? loadBootstrapConfig(resolvePath(opts.config))
         : {};
 
-      const fromPath = resolveRequiredPath(opts.from ?? config.from, "--from");
-      const toPath = resolveRequiredPath(opts.to ?? config.to, "--to");
+      const fromPath = resolveRequiredProjectPath(opts.from ?? config.from, "--from");
+      const toPath = resolveRequiredProjectPath(opts.to ?? config.to, "--to");
       const maxMessages = normalizeMaxMessages(
         opts.maxMessages ?? String(config.maxMessages ?? 16),
       );
@@ -362,14 +436,14 @@ program
 program
   .command("task-start")
   .description("Start a task and set incremental sync marker")
-  .requiredOption("--from <path>", "source project path (A)")
-  .option("--to <paths...>", "default target project paths for this task")
+  .requiredOption("--from <path>", "source project path or service name (A)")
+  .option("--to <paths...>", "default target project paths or service names for this task")
   .requiredOption("--title <text>", "task title")
   .option("--task-id <id>", "task id; auto-generated if omitted")
   .action((opts: { from: string; to?: string[]; title: string; taskId?: string }) => {
     runTaskStart({
-      from: resolvePath(opts.from),
-      targets: (opts.to ?? []).map((p) => resolvePath(p)),
+      from: resolveProjectPath(opts.from),
+      targets: (opts.to ?? []).map((p) => resolveProjectPath(p)),
       title: opts.title,
       taskId: opts.taskId,
     });
@@ -389,16 +463,50 @@ program
     runTaskStatus();
   });
 
+program
+  .command("quickstart")
+  .description("Interactive guide to set up ContextBridge for new users")
+  .action(async () => {
+    await runQuickstart();
+  });
+
 program.parse();
 
 function runSync(options: SyncOptions): void {
-  ensureDirectory(options.from, "source project");
+  try {
+    ensureDirectory(options.from, "source project");
+  } catch (error) {
+    if (error instanceof Error) {
+      printErrorWithRecovery(error.message, [
+        "检查路径是否正确",
+        "运行 `cb services-list` 查看已登记的服务",
+        "运行 `cb services-import --root <目录>` 登记新服务",
+      ]);
+      process.exit(1);
+    }
+    throw error;
+  }
+
   const normalizedFrom = normalizeWorkspacePath(options.from);
   const activeTask = readCurrentTask();
-  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask);
-  for (const target of effectiveTargets) {
-    ensureDirectory(target, "target project");
+  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask, options.from);
+
+  try {
+    for (const target of effectiveTargets) {
+      ensureDirectory(target, "target project");
+    }
+  } catch (error) {
+    if (error instanceof Error) {
+      printErrorWithRecovery(error.message, [
+        "检查路径是否正确",
+        "运行 `cb services-list` 查看已登记的服务",
+        "运行 `cb services-import --root <目录>` 登记新服务",
+      ]);
+      process.exit(1);
+    }
+    throw error;
   }
+
   const effectiveMetadata: SyncMetadata = {
     ...options.metadata,
     taskId: options.metadata.taskId ?? activeTask?.taskId,
@@ -425,7 +533,19 @@ function runSync(options: SyncOptions): void {
     activeTask.lastSyncedAt = new Date().toISOString();
     writeCurrentTask(activeTask);
   } else {
-    snapshot = loadSourceSnapshot(options.from, options.maxMessages);
+    try {
+      snapshot = loadSourceSnapshot(options.from, options.maxMessages);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("No readable source found")) {
+        printErrorWithRecovery("无法读取 Cursor 会话数据", [
+          "确保已在 Cursor 中打开源项目",
+          "进行至少一次对话",
+          "运行 `cb doctor` 检查环境",
+        ]);
+        process.exit(1);
+      }
+      throw error;
+    }
   }
 
   const result = writeSummaryFiles({
@@ -437,10 +557,18 @@ function runSync(options: SyncOptions): void {
     metadata: effectiveMetadata,
   });
 
-  console.log("Sync completed.");
-  console.log(`Source type: ${snapshot.sourceType}`);
-  console.log(`Source file: ${snapshot.sourceFile}`);
-  console.log(`Targets: ${effectiveTargets.join(", ")}`);
+  const messageCount = snapshot.messages.length;
+
+  console.log("");
+  output.success("同步完成");
+  console.log("");
+  output.title("📄 摘要信息");
+  output.section("源项目", getProjectDisplayName(options.from));
+  output.section("数据来源", snapshot.sourceType);
+  output.section("消息数", `${messageCount} 条`);
+
+  console.log("");
+  output.title("📁 生成文件");
   for (const target of effectiveTargets) {
     const targetResult =
       target === effectiveTargets[0]
@@ -454,25 +582,57 @@ function runSync(options: SyncOptions): void {
             metadata: effectiveMetadata,
           });
     for (const filePath of targetResult.generatedPaths) {
-      console.log(`Generated: ${filePath}`);
+      const relativePath = filePath.replace(target, getProjectDisplayName(target));
+      console.log(`  ${relativePath}`);
     }
   }
+
+  console.log("");
+  output.title("💡 下一步");
+  console.log(`  在目标项目 Cursor 中打开 ${pc.dim(".contextbridge/context-summary-latest.md")}`);
 }
 
 function runWatch(options: WatchOptions): void {
-  ensureDirectory(options.from, "source project");
-  const normalizedFrom = normalizeWorkspacePath(options.from);
-  const activeTask = readCurrentTask();
-  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask);
-  for (const target of effectiveTargets) {
-    ensureDirectory(target, "target project");
+  try {
+    ensureDirectory(options.from, "source project");
+  } catch (error) {
+    if (error instanceof Error) {
+      printErrorWithRecovery(error.message, [
+        "检查路径是否正确",
+        "运行 `cb services-list` 查看已登记的服务",
+        "运行 `cb services-import --root <目录>` 登记新服务",
+      ]);
+      process.exit(1);
+    }
+    throw error;
   }
 
-  console.log(
-    `Watching source project changes every ${options.intervalSec}s...`,
-  );
-  console.log(`From: ${options.from}`);
-  console.log(`To: ${effectiveTargets.join(", ")}`);
+  const normalizedFrom = normalizeWorkspacePath(options.from);
+  const activeTask = readCurrentTask();
+  const effectiveTargets = resolveSyncTargets(options.toPaths, activeTask, options.from);
+
+  try {
+    for (const target of effectiveTargets) {
+      ensureDirectory(target, "target project");
+    }
+  } catch (error) {
+    if (error instanceof Error) {
+      printErrorWithRecovery(error.message, [
+        "检查路径是否正确",
+        "运行 `cb services-list` 查看已登记的服务",
+        "运行 `cb services-import --root <目录>` 登记新服务",
+      ]);
+      process.exit(1);
+    }
+    throw error;
+  }
+
+  console.log("");
+  output.title(`👀 监听中 (每 ${options.intervalSec} 秒检查一次)`);
+  output.divider();
+  output.section("源项目", getProjectDisplayName(options.from));
+  output.section("目标项目", effectiveTargets.map((p) => getProjectDisplayName(p)).join(", "));
+  console.log("");
 
   let previousSignature = "";
 
@@ -492,7 +652,7 @@ function runWatch(options: WatchOptions): void {
           activeTask.marker,
         );
         if (incremental.messages.length === 0) {
-          console.log(`[${new Date().toLocaleTimeString()}] No changes detected.`);
+          console.log(`[${new Date().toLocaleTimeString()}] ${pc.dim("ℹ 无变化")}`);
           return;
         }
         snapshot = {
@@ -507,7 +667,7 @@ function runWatch(options: WatchOptions): void {
       } else {
         snapshot = loadSourceSnapshot(options.from, options.maxMessages);
         if (snapshot.sourceSignature === previousSignature) {
-          console.log(`[${new Date().toLocaleTimeString()}] No changes detected.`);
+          console.log(`[${new Date().toLocaleTimeString()}] ${pc.dim("ℹ 无变化")}`);
           return;
         }
       }
@@ -526,15 +686,20 @@ function runWatch(options: WatchOptions): void {
       }
       previousSignature = snapshot.sourceSignature;
 
-      console.log(`[${new Date().toLocaleTimeString()}] Synced successfully.`);
-      console.log(`  Source: ${snapshot.sourceType} ${snapshot.sourceFile}`);
+      const msgCount = snapshot.messages.length;
+      console.log(
+        `[${new Date().toLocaleTimeString()}] ${pc.green("✓")} 已同步 (${msgCount} 条消息)`
+      );
       for (const filePath of outputs) {
-        console.log(`  Output: ${filePath}`);
+        const shortPath = filePath.split(path.sep).slice(-3).join(path.sep);
+        console.log(`  ${pc.dim("→")} ${shortPath}`);
       }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : String(error ?? "unknown error");
-      console.error(`[${new Date().toLocaleTimeString()}] Sync failed: ${message}`);
+      console.error(
+        `[${new Date().toLocaleTimeString()}] ${pc.red("✗")} 同步失败: ${message}`
+      );
     }
   };
 
@@ -673,40 +838,89 @@ function runDoctor(options: DoctorOptions): void {
     return;
   }
 
-  console.log("ContextBridge Doctor Report");
-  console.log(`Projects: ${items.length}, Failed: ${failed.length}`);
+  console.log("");
+  output.title("🔍 环境诊断报告");
+  output.divider();
+  console.log("");
+
+  // 表格输出
+  const header = "项目              Cursor    Transcript    Worker Log    Summary";
+  console.log(pc.dim(header));
+  console.log(pc.dim("─".repeat(55)));
+
   for (const item of items) {
-    console.log("");
-    console.log(`- Project: ${item.projectPath}`);
-    console.log(`  Cursor dir: ${item.cursorProjectDirExists ? "OK" : "Missing"}`);
-    console.log(
-      `  Transcript: ${
-        item.transcriptReadable
-          ? `OK (${item.transcriptCount} files)`
-          : item.transcriptExists
-            ? "Unreadable"
-            : "Missing"
-      }`,
-    );
-    console.log(
-      `  Worker log: ${
-        item.workerLogReadable
-          ? "OK"
-          : item.workerLogExists
-            ? "Unreadable"
-            : "Missing"
-      }`,
-    );
-    console.log(
-      `  Latest summary json: ${
-        item.latestSummaryJsonReadable
-          ? "OK"
-          : item.latestSummaryJsonExists
-            ? "Unreadable"
-            : "Missing"
-      }`,
-    );
+    const name = getProjectDisplayName(item.projectPath).padEnd(16);
+    const cursorStatus = item.cursorProjectDirExists
+      ? pc.green("✓")
+      : pc.red("✗ 缺失");
+
+    const transcriptStatus = item.transcriptReadable
+      ? pc.green(`✓ ${item.transcriptCount} 个`)
+      : item.transcriptExists
+        ? pc.yellow("✗ 无法读取")
+        : pc.red("✗ 缺失");
+
+    const workerLogStatus = item.workerLogReadable
+      ? pc.green("✓")
+      : item.workerLogExists
+        ? pc.yellow("✗ 无法读取")
+        : pc.red("✗ 缺失");
+
+    const summaryStatus = item.latestSummaryJsonReadable
+      ? pc.green("✓")
+      : item.latestSummaryJsonExists
+        ? pc.yellow("✗ 无法读取")
+        : pc.red("✗ 缺失");
+
+    console.log(`${name}    ${cursorStatus}     ${transcriptStatus}     ${workerLogStatus}     ${summaryStatus}`);
   }
+
+  // 问题汇总
+  const problems: { project: string; issue: string; suggestion: string }[] = [];
+  for (const item of items) {
+    const projectName = getProjectDisplayName(item.projectPath);
+    if (!item.cursorProjectDirExists) {
+      problems.push({
+        project: projectName,
+        issue: "Cursor 目录不存在",
+        suggestion: "请先在 Cursor 中打开该项目",
+      });
+    }
+    if (!item.transcriptReadable && !item.transcriptExists) {
+      problems.push({
+        project: projectName,
+        issue: "无 transcript 文件",
+        suggestion: "请先在 Cursor 中打开该项目并进行对话",
+      });
+    }
+    if (!item.workerLogReadable && !item.workerLogExists) {
+      problems.push({
+        project: projectName,
+        issue: "无 worker.log 文件",
+        suggestion: "请先在 Cursor 中使用该项目",
+      });
+    }
+    if (!item.latestSummaryJsonExists) {
+      problems.push({
+        project: projectName,
+        issue: "无摘要文件",
+        suggestion: "运行 `cb sync` 生成",
+      });
+    }
+  }
+
+  if (problems.length > 0) {
+    console.log("");
+    output.warning(`发现 ${problems.length} 个问题:`);
+    for (const p of problems) {
+      console.log(`  • ${p.project}: ${p.issue}`);
+      console.log(pc.dim(`    → ${p.suggestion}`));
+    }
+  } else {
+    console.log("");
+    output.success("所有项目环境正常");
+  }
+  console.log("");
 }
 
 function runBootstrap(options: BootstrapOptions): void {
@@ -865,29 +1079,286 @@ function runTaskStop(): void {
 function runTaskStatus(): void {
   const task = readCurrentTask();
   if (!task) {
-    console.log("No active task.");
+    output.info("当前无活跃任务");
     return;
   }
 
-  console.log("Active task:");
-  console.log(`- Task ID: ${task.taskId}`);
-  console.log(`- Title: ${task.title}`);
-  console.log(`- From: ${task.from}`);
+  console.log("");
+  output.title("📋 当前任务");
+  output.divider();
+  output.section("任务 ID", task.taskId);
+  output.section("标题", task.title);
+  output.section("源项目", getProjectDisplayName(task.from));
   if (task.targets.length > 0) {
-    console.log(`- Targets: ${task.targets.join(", ")}`);
+    output.section("目标项目", task.targets.map((p) => getProjectDisplayName(p)).join(", "));
   }
-  console.log(`- Started: ${task.startedAt}`);
+  output.section("开始时间", formatTimestamp(task.startedAt));
   if (task.lastSyncedAt) {
-    console.log(`- Last Synced: ${task.lastSyncedAt}`);
+    output.section("最后同步", formatTimestamp(task.lastSyncedAt));
   }
+
+  console.log("");
+  output.title("📌 锚点位置");
   if (task.marker.kind === "transcript") {
-    console.log(
-      `- Marker: transcript ${task.marker.filePath} @line ${task.marker.lineOffset}`,
-    );
+    output.section("类型", "transcript");
+    output.section("行号", `@line ${task.marker.lineOffset}`);
+    const shortFile = task.marker.filePath.split(path.sep).slice(-2).join(path.sep);
+    output.section("文件", shortFile);
   } else {
+    output.section("类型", "worker-log");
+    output.section("字节偏移", `@byte ${task.marker.byteOffset}`);
+    const shortFile = task.marker.filePath.split(path.sep).slice(-2).join(path.sep);
+    output.section("文件", shortFile);
+  }
+  console.log("");
+}
+
+async function runQuickstart(): Promise<void> {
+  console.log("");
+  output.title("✨ 欢迎使用 ContextBridge CLI");
+  output.divider();
+  console.log("");
+
+  // 获取已注册的服务列表
+  const registry = readServiceRegistry();
+  const hasServices = registry.services.length > 0;
+
+  // 1. 选择源项目
+  const sourceChoices: { name: string; value: string }[] = hasServices
+    ? registry.services.map((s) => ({ name: s.name, value: s.path }))
+    : [];
+
+  sourceChoices.push({ name: "手动输入路径...", value: "__manual__" });
+
+  const sourceAnswer = await inquirer.prompt<{
+    source: string;
+  }>([
+    {
+      type: "list",
+      name: "source",
+      message: "选择源项目 (使用 Cursor 对话的项目):",
+      choices: sourceChoices,
+      pageSize: 10,
+    },
+  ]);
+
+  let fromPath: string;
+  if (sourceAnswer.source === "__manual__") {
+    const manualAnswer = await inquirer.prompt<{
+      path: string;
+    }>([
+      {
+        type: "input",
+        name: "path",
+        message: "输入源项目路径:",
+        validate: (input: string) => {
+          if (!input.trim()) return "请输入路径";
+          const resolved = resolvePath(input.trim());
+          if (!fs.existsSync(resolved)) return `路径不存在: ${resolved}`;
+          if (!fs.statSync(resolved).isDirectory()) return "路径不是目录";
+          return true;
+        },
+      },
+    ]);
+    fromPath = resolvePath(manualAnswer.path);
+  } else {
+    fromPath = sourceAnswer.source;
+  }
+
+  // 2. 选择目标项目
+  const targetChoices: { name: string; value: string }[] = hasServices
+    ? registry.services
+        .filter((s) => s.path !== fromPath)
+        .map((s) => ({ name: s.name, value: s.path }))
+    : [];
+
+  targetChoices.push({ name: "手动输入路径...", value: "__manual__" });
+
+  const targetAnswer = await inquirer.prompt<{
+    targets: string[];
+  }>([
+    {
+      type: "checkbox",
+      name: "targets",
+      message: "选择目标项目 (将同步上下文到此项目):",
+      choices: targetChoices,
+      pageSize: 10,
+      validate: (input: string[]) => {
+        if (input.length === 0) return "请至少选择一个目标项目";
+        return true;
+      },
+    },
+  ]);
+
+  const toPaths: string[] = [];
+  for (const target of targetAnswer.targets) {
+    if (target === "__manual__") {
+      const manualAnswer = await inquirer.prompt<{
+        path: string;
+      }>([
+        {
+          type: "input",
+          name: "path",
+          message: "输入目标项目路径:",
+          validate: (input: string) => {
+            if (!input.trim()) return "请输入路径";
+            const resolved = resolvePath(input.trim());
+            if (!fs.existsSync(resolved)) return `路径不存在: ${resolved}`;
+            if (!fs.statSync(resolved).isDirectory()) return "路径不是目录";
+            return true;
+          },
+        },
+      ]);
+      toPaths.push(resolvePath(manualAnswer.path));
+    } else {
+      toPaths.push(target);
+    }
+  }
+
+  // 3. 可选：任务 ID
+  const taskIdAnswer = await inquirer.prompt<{
+    taskId: string;
+  }>([
+    {
+      type: "input",
+      name: "taskId",
+      message: "任务 ID (可选，用于追踪):",
+      default: "",
+    },
+  ]);
+
+  // 4. 可选：关联服务
+  const servicesAnswer = await inquirer.prompt<{
+    services: string;
+  }>([
+    {
+      type: "input",
+      name: "services",
+      message: "关联服务 (可选，多个用逗号分隔):",
+      default: "",
+    },
+  ]);
+
+  // 5. 可选：关联接口
+  const apisAnswer = await inquirer.prompt<{
+    apis: string;
+  }>([
+    {
+      type: "input",
+      name: "apis",
+      message: "关联接口 (可选，多个用逗号分隔):",
+      default: "",
+    },
+  ]);
+
+  // 6. 可选：已知风险
+  const risksAnswer = await inquirer.prompt<{
+    risks: string;
+  }>([
+    {
+      type: "input",
+      name: "risks",
+      message: "已知风险 (可选):",
+      default: "",
+    },
+  ]);
+
+  // 解析可选参数
+  const taskId = taskIdAnswer.taskId.trim() || undefined;
+  const services = servicesAnswer.services
+    ? servicesAnswer.services
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const apis = apisAnswer.apis
+    ? apisAnswer.apis
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const risks = risksAnswer.risks
+    ? risksAnswer.risks
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+
+  // 开始执行
+  console.log("");
+  output.title("🚀 正在初始化...");
+  output.divider();
+  console.log("");
+
+  try {
+    // 初始化目标项目
+    for (const target of toPaths) {
+      runInit({ target });
+    }
+    output.success("已初始化目标项目");
+
+    // 同步上下文
+    const metadata: SyncMetadata = {
+      taskId,
+      services,
+      apiInterfaces: apis,
+      risks,
+    };
+
+    const syncOptions: SyncOptions = {
+      from: fromPath,
+      toPaths,
+      maxMessages: 16,
+      outputFormat: "both",
+      metadata,
+    };
+
+    // 获取消息数量
+    const snapshot = loadSourceSnapshot(fromPath, 16);
+    const messageCount = snapshot.messages.length;
+
+    runSync(syncOptions);
+    output.success(`已同步上下文 (${messageCount} 条消息)`);
+
+    // 运行诊断
+    runDoctor({
+      projects: [fromPath, ...toPaths],
+      outputFormat: "text",
+    });
+
+    // 输出总结
+    console.log("");
+    output.title("📄 摘要信息");
+    output.section("源项目", getProjectDisplayName(fromPath));
+    output.section("消息数", `${messageCount} 条`);
+    output.section("目标项目", toPaths.map((p) => getProjectDisplayName(p)).join(", "));
+
+    console.log("");
+    output.title("📁 生成文件");
+    for (const target of toPaths) {
+      const mdPath = path.join(target, ".contextbridge", "context-summary-latest.md");
+      const jsonPath = path.join(target, ".contextbridge", "context-summary-latest.json");
+      console.log(`  ${getProjectDisplayName(target)}/.contextbridge/context-summary-latest.md`);
+      console.log(`  ${getProjectDisplayName(target)}/.contextbridge/context-summary-latest.json`);
+    }
+
+    console.log("");
+    output.title("💡 下一步");
+    console.log("  在目标项目 Cursor 中打开:");
+    console.log(pc.dim("    .contextbridge/context-summary-latest.md"));
+    console.log("");
+    console.log("  使用以下提示词开始:");
     console.log(
-      `- Marker: worker-log ${task.marker.filePath} @byte ${task.marker.byteOffset}`,
+      pc.dim(
+        '    "继续上一个跨服务任务，请先读取 .contextbridge/context-summary-latest.md..."'
+      )
     );
+    console.log("");
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error ?? "unknown error");
+    printErrorWithRecovery(message, []);
+    process.exit(1);
   }
 }
 
@@ -1521,6 +1992,13 @@ function resolveRequiredPath(input: string | undefined, optionName: string): str
   return resolvePath(input);
 }
 
+function resolveRequiredProjectPath(input: string | undefined, optionName: string): string {
+  if (!input) {
+    throw new Error(`Missing required option ${optionName} (or provide it in --config).`);
+  }
+  return resolveProjectPath(input);
+}
+
 function normalizeMetadata(input: {
   taskId?: string;
   services?: string[];
@@ -1538,20 +2016,66 @@ function normalizeMetadata(input: {
 function resolveSyncTargets(
   cliTargets: string[],
   activeTask: TaskState | null,
+  sourcePath?: string,
 ): string[] {
   const normalizedCliTargets = dedupeLines(cliTargets.map((p) => normalizeWorkspacePath(p)));
   if (normalizedCliTargets.length > 0) {
     return normalizedCliTargets;
   }
-  const taskTargets = activeTask?.targets ?? [];
-  if (taskTargets.length > 0) {
-    return dedupeLines(taskTargets.map((p) => normalizeWorkspacePath(p)));
+
+  // 如果有活跃任务且源项目一致，使用任务的目标
+  if (activeTask) {
+    const normalizedSource = sourcePath ? normalizeWorkspacePath(sourcePath) : "";
+    if (normalizedSource === activeTask.from || !sourcePath) {
+      const taskTargets = activeTask.targets ?? [];
+      if (taskTargets.length > 0) {
+        return dedupeLines(taskTargets.map((p) => normalizeWorkspacePath(p)));
+      }
+    }
   }
-  throw new Error("No target project provided. Use --to or set targets in task-start.");
+
+  // 检查当前目录是否是已登记的服务，尝试提示可能的目标
+  const cwd = process.cwd();
+  const registry = readServiceRegistry();
+  const currentService = registry.services.find((s) => s.path === cwd);
+
+  if (currentService) {
+    printErrorWithRecovery(`当前在服务 ${currentService.name}，未指定目标项目`, [
+      "使用 `--to <服务名>` 指定目标项目",
+      "运行 `cb task-start --to <服务名>` 设置默认目标",
+      "运行 `cb quickstart` 进行交互式配置",
+    ]);
+  } else {
+    printErrorWithRecovery("未指定目标项目", [
+      "使用 `--to <项目路径或服务名>` 指定目标项目",
+      "运行 `cb task-start --to <服务名>` 设置默认目标",
+      "运行 `cb quickstart` 进行交互式配置",
+    ]);
+  }
+  process.exit(1);
 }
 
 function resolvePath(inputPath: string): string {
   return path.resolve(inputPath);
+}
+
+function resolveProjectPath(input: string): string {
+  const trimmed = input.trim();
+
+  // 1. 检查是否是已注册的服务名
+  const registry = readServiceRegistry();
+  const service = registry.services.find((s) => s.name === trimmed);
+  if (service) {
+    return service.path;
+  }
+
+  // 2. 检查是否是路径（包含路径分隔符或驱动器字母）
+  if (trimmed.includes("/") || trimmed.includes("\\") || /^[A-Za-z]:/.test(trimmed)) {
+    return resolvePath(trimmed);
+  }
+
+  // 3. 既不是服务名也不是路径，尝试作为相对路径
+  return resolvePath(trimmed);
 }
 
 function ensureDirectory(targetPath: string, label: string): void {
