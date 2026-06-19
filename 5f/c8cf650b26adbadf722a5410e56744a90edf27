@@ -1,0 +1,42 @@
+src/index.ts
+  s_dcdba5228ca86a::t_258571d0c215ee 68-86,88-92
+  s_dcdba5228ca86a::t_b5d752ca86de59 1538-1552
+  s_dcdba5228ca86a::t_233e08b0800ac7 747-815
+  s_dcdba5228ca86a::t_120d826fafa2dd 1838-1843
+  s_dcdba5228ca86a::t_70a3a2824bd0bf 362-365,367-368,370-371,373-391
+  s_dcdba5228ca86a::t_855b45762b0de0 398-401,433,443-458,465-469,475,515-526,531
+  s_dcdba5228ca86a::t_162016c93aae73 1771-1837,1844-1887
+  s_dcdba5228ca86a::t_7f2cd5b2d1ab9c 713-717,722-724,739
+  s_dcdba5228ca86a::t_db85733362ed1f 816-817,819-823,828-833,835-844,848-875,879-893
+  s_dcdba5228ca86a::t_501f8a80043c1f 396-397,402-429,437,464,481-512
+  s_dcdba5228ca86a::t_0a158c83119ffe 929-1055
+  s_dcdba5228ca86a::t_305eac741ff880 1719-1770
+  s_dcdba5228ca86a::t_2cac2e59253dfd 366,369,372
+  s_dcdba5228ca86a::t_15a1b0e956c5af 16,87
+  s_dcdba5228ca86a::t_04db46f9c11aa1 157,167,177,196,207,218
+  s_dcdba5228ca86a::t_3b150f78c8bfc3 328,730
+  s_dcdba5228ca86a::t_8a6a844be0f668 818,824-827,834,845-847,876-878
+  s_dcdba5228ca86a::t_7f1699e28e09c8 1126-1129,1132,1151-1153,1155-1156,1164-1165,1167-1168
+  s_dcdba5228ca86a::t_6dc05182492b9b 343-361
+  s_dcdba5228ca86a::t_5a46d070d99471 57-67
+README.md
+  s_dcdba5228ca86a::t_fe8fd1b8a942fb 110-129
+  s_dcdba5228ca86a::t_fc749593d34b2e 88-92,94-109
+  s_dcdba5228ca86a::t_20e879432899d7 33,93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "5fc8cf650b26adbadf722a5410e56744a90edf27",
+  "prompts": {},
+  "sessions": {
+    "s_dcdba5228ca86a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "6129cb04-16ea-4ce8-bd7f-f71ce4428b1a",
+        "model": "gpt-5.3-codex"
+      },
+      "human_author": "kyrie.guo <kyrie.guo@jtexpress.com>"
+    }
+  }
+}
