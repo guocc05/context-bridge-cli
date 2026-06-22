@@ -1,0 +1,112 @@
+<title>ContextBridge CLI 产品介绍与使用指南（更新版）</title>
+
+<callout emoji="✅" background-color="light-green" border-color="green">
+  <p><b>结论先行：</b>ContextBridge CLI 用“任务锚点 + 增量同步 + 多目标路由”解决多服务协作时上下文重复描述的问题，适合 IDEA + Cursor 插件场景。</p>
+</callout>
+
+<h1>1. 产品是什么</h1>
+<p>ContextBridge CLI 是一个本地命令行工具，用于在多个 Java 服务项目之间同步 Cursor 上下文，减少“在 A 项目讲过一遍，到 B/C 项目还要再讲一遍”的沟通成本。</p>
+<table>
+  <thead>
+    <tr><th>能力</th><th>作用</th><th>价值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>上下文同步</td><td>A 到 B/C 的摘要同步</td><td>避免重复描述需求背景</td></tr>
+    <tr><td>任务锚点</td><td>只抽取本次任务新增内容</td><td>减少旧对话串线</td></tr>
+    <tr><td>多目标路由</td><td>一次配置多个目标服务</td><td>适配多仓库联动开发</td></tr>
+    <tr><td>诊断与导出</td><td>doctor / export</td><td>便于排障与周会汇总</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>2. 适用场景</h1>
+<ul>
+  <li>A 服务先梳理需求，再同步到 B、C 服务继续开发</li>
+  <li>同一需求跨多天推进，需要保持上下文连续</li>
+  <li>多团队协作，需要保留可追溯的“目标-决策-执行记录”</li>
+</ul>
+
+<callout emoji="⚠️" background-color="light-yellow" border-color="yellow">
+  <p><b>注意：</b>该工具是“项目内摘要中间层”，不是直接改写 Cursor 原始数据库。</p>
+</callout>
+
+<hr/>
+
+<h1>3. 新人最快上手（3 步）</h1>
+<h2>3.1 安装</h2>
+<pre lang="bash"><code>git clone https://github.com/guocc05/context-bridge-cli.git
+cd context-bridge-cli
+npm install
+npm run build
+npm link</code></pre>
+
+<h2>3.2 开始任务（设置锚点）</h2>
+<pre lang="bash"><code>cb task-start --from "A项目路径" --to "B项目路径" "C项目路径" --title "导出新增字段"</code></pre>
+
+<h2>3.3 同步（可不写 --to）</h2>
+<pre lang="bash"><code>cb sync --from "A项目路径" --output both</code></pre>
+<p>如果 task-start 已配置目标，sync/watch 不传 --to 会自动使用任务目标。</p>
+
+<hr/>
+
+<h1>4. 关键命令清单</h1>
+<table>
+  <thead>
+    <tr><th>类别</th><th>命令</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>任务</td><td><code>cb task-start</code></td><td>创建任务并记录锚点（建议入口）</td></tr>
+    <tr><td>任务</td><td><code>cb task-status</code></td><td>查看当前任务、来源和目标</td></tr>
+    <tr><td>任务</td><td><code>cb task-stop</code></td><td>结束任务并归档</td></tr>
+    <tr><td>同步</td><td><code>cb sync</code></td><td>单次同步；有任务时走增量</td></tr>
+    <tr><td>同步</td><td><code>cb watch</code></td><td>持续增量同步</td></tr>
+    <tr><td>诊断</td><td><code>cb doctor</code></td><td>检查 transcript/worker.log/summary 可用性</td></tr>
+    <tr><td>汇总</td><td><code>cb export</code></td><td>多项目 latest.json 聚合输出</td></tr>
+    <tr><td>服务管理</td><td><code>cb services-import</code></td><td>批量登记指定目录下所有一级服务</td></tr>
+    <tr><td>服务管理</td><td><code>cb services-list</code></td><td>查看已登记服务</td></tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h1>5. 多服务推荐流程（A -&gt; B/C 动态切换）</h1>
+<ol>
+  <li>先在 A 启动任务：<code>task-start --from A --to B C</code></li>
+  <li>当天需要 A 到 B/C：执行 <code>sync --from A</code></li>
+  <li>明天只需要 A 到 C：执行 <code>sync --from A --to C</code></li>
+  <li>任务结束：<code>task-stop</code></li>
+</ol>
+
+<callout emoji="💡" background-color="light-blue" border-color="blue">
+  <p>命令行参数优先级高于任务默认目标：临时改路由时直接传 <code>--to</code> 即可。</p>
+</callout>
+
+<hr/>
+
+<h1>6. 常见问题（FAQ）</h1>
+<h2>Q1：怎么确保同步的是“这次任务”而不是旧聊天？</h2>
+<p>通过 task-start 创建锚点，sync/watch 只抽取锚点之后新增内容，避免旧内容混入。</p>
+
+<h2>Q2：必须每次都写 task-id 吗？</h2>
+<p>不需要。task-start 可自动生成 TASK-YYYYMMDD-HHmm；也支持手动指定。</p>
+
+<h2>Q3：我有很多服务，能一次性登记吗？</h2>
+<pre lang="bash"><code>cb services-import --root "C:\Users\kyrie.guo\IdeaProjects"</code></pre>
+
+<h2>Q4：项目协议是否允许商用？</h2>
+<p>当前协议为 PolyForm Noncommercial 1.0.0，默认禁止未授权商用。</p>
+
+<hr/>
+
+<h1>7. 产出文件说明</h1>
+<ul>
+  <li><code>.contextbridge/context-summary-latest.md</code></li>
+  <li><code>.contextbridge/context-summary-latest.json</code></li>
+  <li><code>.contextbridge/context-summary-YYYYMMDD-HHmmss.*</code></li>
+  <li><code>.contextbridge/context-entry.md</code></li>
+</ul>
+
+<callout emoji="🚀" background-color="light-green" border-color="green">
+  <p>建议团队统一执行：<code>task-start -&gt; sync/watch -&gt; task-stop</code>，将“能用”升级为“稳定可靠”。</p>
+</callout>

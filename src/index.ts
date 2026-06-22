@@ -5,6 +5,7 @@ import path from "path";
 import { Command } from "commander";
 import inquirer from "inquirer";
 import pc from "picocolors";
+import Database from "better-sqlite3";
 
 type ChatRole = "user" | "assistant" | "system" | "unknown";
 
@@ -122,6 +123,22 @@ interface SummaryJson {
   };
 }
 
+interface InboxEntry {
+  taskId: string;
+  receivedAt: string;
+  sourceProject: string;
+  sourceServiceName: string;
+  messageCount: number;
+  targetServices: string[];
+  summaryFile: string;
+  archiveFile: string;
+}
+
+interface InboxState {
+  version: 1;
+  entries: InboxEntry[];
+}
+
 interface DoctorItem {
   projectPath: string;
   cursorProjectDir: string;
@@ -139,7 +156,7 @@ interface DoctorItem {
 }
 
 interface SourceSnapshot {
-  sourceType: "transcript" | "worker-log";
+  sourceType: "acp-session" | "transcript" | "worker-log";
   sourceFile: string;
   sourceSignature: string;
   messages: ChatMessage[];
@@ -199,6 +216,23 @@ program
   .name("cb")
   .description("ContextBridge CLI - sync Cursor context between local projects")
   .version("1.0.0");
+
+program
+  .command("setup")
+  .description("Quick setup: register services from IdeaProjects directory")
+  .action(async () => {
+    await runSetup();
+  });
+
+program
+  .command("push")
+  .description("Push context from current directory to target service(s) - simplified sync")
+  .argument("[targets...]", "target service names or paths")
+  .option("--watch", "enable continuous sync mode", false)
+  .option("--interval <seconds>", "watch interval seconds (only with --watch)", "20")
+  .action(async (targets: string[], opts: { watch: boolean; interval: string }) => {
+    await runPush({ targets, watch: opts.watch, intervalSec: normalizeInterval(opts.interval) });
+  });
 
 program
   .command("sync")
@@ -434,6 +468,14 @@ program
   });
 
 program
+  .command("services-remove")
+  .description("Remove a registered service")
+  .argument("<name>", "service name to remove")
+  .action((name: string) => {
+    runServicesRemove(name);
+  });
+
+program
   .command("task-start")
   .description("Start a task and set incremental sync marker")
   .requiredOption("--from <path>", "source project path or service name (A)")
@@ -471,6 +513,452 @@ program
   });
 
 program.parse();
+
+async function runSetup(): Promise<void> {
+  console.log("");
+  output.title("⚡ 快速配置");
+  output.divider();
+  console.log("");
+
+  const home = getUserHomeDir();
+  const defaultRoot = path.join(home, "IdeaProjects");
+
+  // 检测默认目录是否存在
+  const rootPath = fs.existsSync(defaultRoot) ? defaultRoot : home;
+
+  const rootAnswer = await inquirer.prompt<{
+    root: string;
+  }>([
+    {
+      type: "input",
+      name: "root",
+      message: "扫描项目目录:",
+      default: rootPath,
+      validate: (input: string) => {
+        if (!input.trim()) return "请输入路径";
+        const resolved = resolvePath(input.trim());
+        if (!fs.existsSync(resolved)) return `路径不存在: ${resolved}`;
+        if (!fs.statSync(resolved).isDirectory()) return "路径不是目录";
+        return true;
+      },
+    },
+  ]);
+
+  const scanRoot = resolvePath(rootAnswer.root);
+
+  // 扫描项目
+  const entries = fs
+    .readdirSync(scanRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .filter((entry) => !entry.name.startsWith("."))
+    .map((entry) => ({
+      name: entry.name,
+      path: path.join(scanRoot, entry.name),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  if (entries.length === 0) {
+    output.warning(`在 ${scanRoot} 下未发现项目目录`);
+    console.log("");
+    output.dim("请手动指定其他目录");
+    return;
+  }
+
+  console.log("");
+  output.info(`发现 ${entries.length} 个项目目录`);
+
+  // 让用户选择要注册的项目
+  const selectAnswer = await inquirer.prompt<{
+    services: string[];
+  }>([
+    {
+      type: "checkbox",
+      name: "services",
+      message: "选择要注册的服务 (空格选择，回车确认):",
+      choices: entries.map((e) => ({ name: e.name, value: e.path, checked: true })),
+      pageSize: 15,
+    },
+  ]);
+
+  if (selectAnswer.services.length === 0) {
+    output.warning("未选择任何服务");
+    return;
+  }
+
+  // 写入注册表
+  const registry = readServiceRegistry();
+  let added = 0;
+  let updated = 0;
+
+  for (const servicePath of selectAnswer.services) {
+    const name = path.basename(servicePath);
+    const existingIndex = registry.services.findIndex((s) => s.name === name);
+
+    if (existingIndex >= 0) {
+      registry.services[existingIndex] = {
+        name,
+        path: servicePath,
+        addedAt: new Date().toISOString(),
+      };
+      updated += 1;
+    } else {
+      registry.services.push({
+        name,
+        path: servicePath,
+        addedAt: new Date().toISOString(),
+      });
+      added += 1;
+    }
+  }
+
+  registry.services.sort((a, b) => a.name.localeCompare(b.name));
+  writeServiceRegistry(registry);
+
+  // 为每个服务生成 .cursorrules 文件
+  const cursorrulesContent = buildCursorrulesContent(registry.services);
+  for (const svc of registry.services) {
+    const cursorrulesPath = path.join(svc.path, ".cursorrules");
+    if (!fs.existsSync(cursorrulesPath)) {
+      fs.writeFileSync(cursorrulesPath, cursorrulesContent, "utf8");
+    }
+  }
+
+  console.log("");
+  output.success(`已注册 ${added + updated} 个服务 (新增 ${added}, 更新 ${updated})`);
+  output.dim("已为各服务生成 .cursorrules 文件");
+  console.log("");
+
+  // 显示已注册的服务列表
+  output.title("📋 已注册服务");
+  for (const svc of registry.services) {
+    console.log(`  ${pc.cyan(svc.name)} ${pc.dim(svc.path)}`);
+  }
+
+  console.log("");
+  output.title("💡 下一步");
+  console.log("  在任意项目目录下运行:");
+  console.log(pc.dim("    cb push <目标服务名>"));
+  console.log("");
+  console.log("  或在 Cursor 中对 AI 说:");
+  console.log(pc.dim("    把上下文同步到 <目标服务名>"));
+  console.log("");
+}
+
+async function runPush(options: { targets: string[]; watch: boolean; intervalSec: number }): Promise<void> {
+  const fromPath = process.cwd();
+  let registry = readServiceRegistry();
+
+  // 自动注册当前服务（如果未注册）
+  const currentService = registry.services.find((s) => s.path === fromPath);
+  let currentServiceName: string;
+  let currentRegistered = false;
+
+  if (!currentService) {
+    currentServiceName = path.basename(fromPath);
+    registry.services.push({
+      name: currentServiceName,
+      path: fromPath,
+      addedAt: new Date().toISOString(),
+    });
+    registry.services.sort((a, b) => a.name.localeCompare(b.name));
+    writeServiceRegistry(registry);
+    currentRegistered = true;
+  } else {
+    currentServiceName = currentService.name;
+  }
+
+  console.log("");
+  output.title("📤 推送上下文");
+  output.divider();
+  if (currentRegistered) {
+    output.section("源项目", `${currentServiceName} (新注册)`);
+  } else {
+    output.section("源项目", currentServiceName);
+  }
+
+  let toPaths: string[] = [];
+  let targetNames: string[] = [];
+
+  if (options.targets.length > 0) {
+    // 命令行参数指定目标
+    for (const target of options.targets) {
+      const trimmed = target.trim();
+
+      // 检查是否是已注册的服务名（精确匹配）
+      const exactMatch = registry.services.find((s) => s.name === trimmed);
+      if (exactMatch) {
+        toPaths.push(exactMatch.path);
+        targetNames.push(exactMatch.name);
+        continue;
+      }
+
+      // 模糊匹配：在已注册服务中查找
+      const fuzzyMatches = registry.services.filter((s) =>
+        s.name.toLowerCase().includes(trimmed.toLowerCase())
+      );
+      if (fuzzyMatches.length === 1) {
+        toPaths.push(fuzzyMatches[0].path);
+        targetNames.push(fuzzyMatches[0].name);
+        continue;
+      } else if (fuzzyMatches.length > 1) {
+        // 多个匹配，提示用户
+        console.log("");
+        output.warning(`"${trimmed}" 匹配到多个服务，请选择:`);
+        for (const m of fuzzyMatches) {
+          console.log(`  - ${m.name}`);
+        }
+        process.exit(1);
+      }
+
+      // 检查是否是路径
+      if (trimmed.includes("/") || trimmed.includes("\\") || /^[A-Za-z]:/.test(trimmed)) {
+        const resolvedPath = resolvePath(trimmed);
+        if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
+          // 自动注册目标服务
+          const targetName = path.basename(resolvedPath);
+          if (!registry.services.some((s) => s.path === resolvedPath)) {
+            registry.services.push({
+              name: targetName,
+              path: resolvedPath,
+              addedAt: new Date().toISOString(),
+            });
+            registry.services.sort((a, b) => a.name.localeCompare(b.name));
+            writeServiceRegistry(registry);
+            output.section("目标服务", `${targetName} (新注册)`);
+          }
+          toPaths.push(resolvedPath);
+          targetNames.push(targetName);
+          continue;
+        }
+      }
+
+      // 在源项目的父目录中搜索匹配的项目
+      const parentDir = path.dirname(fromPath);
+      if (fs.existsSync(parentDir)) {
+        const siblingDirs = fs
+          .readdirSync(parentDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+          .map((entry) => ({
+            name: entry.name,
+            path: path.join(parentDir, entry.name),
+          }));
+
+        // 模糊匹配同级目录
+        const siblingMatches = siblingDirs.filter((d) =>
+          d.name.toLowerCase().includes(trimmed.toLowerCase())
+        );
+
+        if (siblingMatches.length === 1) {
+          const matched = siblingMatches[0];
+          // 自动注册
+          if (!registry.services.some((s) => s.path === matched.path)) {
+            registry.services.push({
+              name: matched.name,
+              path: matched.path,
+              addedAt: new Date().toISOString(),
+            });
+            registry.services.sort((a, b) => a.name.localeCompare(b.name));
+            writeServiceRegistry(registry);
+          }
+          toPaths.push(matched.path);
+          targetNames.push(matched.name);
+          console.log(`  ${pc.dim("自动发现:")} ${matched.name}`);
+          continue;
+        } else if (siblingMatches.length > 1) {
+          console.log("");
+          output.warning(`"${trimmed}" 匹配到多个目录，请选择:`);
+          for (const m of siblingMatches) {
+            console.log(`  - ${m.name}`);
+          }
+          process.exit(1);
+        }
+      }
+
+      // 完全没找到
+      console.log("");
+      output.error(`未找到服务: ${trimmed}`);
+      output.dim("提示: 确保目标服务目录存在，或输入完整路径");
+    }
+  } else {
+    // 交互式选择目标
+    const availableTargets = registry.services.filter((s) => s.path !== fromPath);
+
+    if (availableTargets.length === 0) {
+      printErrorWithRecovery("没有可用的目标服务", [
+        "运行 `cb setup` 注册服务",
+        "或使用 `cb push <服务路径>` 手动指定",
+      ]);
+      process.exit(1);
+    }
+
+    const answer = await inquirer.prompt<{
+      targets: string[];
+    }>([
+      {
+        type: "checkbox",
+        name: "targets",
+        message: "选择目标服务:",
+        choices: availableTargets.map((s) => ({ name: s.name, value: s.path })),
+        pageSize: 12,
+        validate: (input: string[]) => {
+          if (input.length === 0) return "请至少选择一个目标服务";
+          return true;
+        },
+      },
+    ]);
+
+    toPaths = answer.targets;
+    targetNames = toPaths.map((p) => {
+      const svc = registry.services.find((s) => s.path === p);
+      return svc?.name ?? path.basename(p);
+    });
+  }
+
+  // 显示目标
+  output.section("目标项目", targetNames.join(", "));
+  console.log("");
+
+  // 执行同步
+  try {
+    const snapshot = loadSourceSnapshot(fromPath, 16);
+    const now = new Date().toISOString();
+    const stamp = formatDate(new Date());
+    // 使用 sessionId 作为 task-id（如果有的话），否则生成新的
+    const taskId = snapshot.sessionId || generateTaskId();
+
+    for (const targetPath of toPaths) {
+      const targetService = registry.services.find((s) => s.path === targetPath);
+      const targetName = targetService?.name ?? path.basename(targetPath);
+
+      // 确保目标目录存在
+      const outDir = path.join(targetPath, ".contextbridge");
+      fs.mkdirSync(outDir, { recursive: true });
+
+      const result = writeSummaryFiles({
+        sourceProject: fromPath,
+        targetProject: targetPath,
+        snapshot,
+        maxMessages: 16,
+        outputFormat: "both",
+        metadata: { taskId, services: [], apiInterfaces: [], risks: [] },
+      });
+
+      // 更新收件箱（去重）
+      const inbox = readInbox(targetPath);
+      const archiveFile = result.generatedPaths.find((p) => p.includes(stamp)) ?? result.generatedPaths[0] ?? "";
+
+      // 移除已存在的相同 taskId
+      inbox.entries = inbox.entries.filter((e) => e.taskId !== taskId);
+      inbox.entries.unshift({
+        taskId,
+        receivedAt: now,
+        sourceProject: fromPath,
+        sourceServiceName: currentServiceName,
+        messageCount: snapshot.messages.length,
+        targetServices: targetNames,
+        summaryFile: path.join(targetPath, ".contextbridge", "context-summary-latest.md"),
+        archiveFile,
+      });
+      inbox.entries = inbox.entries.slice(0, 50); // 保留最近50条
+      writeInbox(targetPath, inbox);
+
+      // 生成收件箱 Markdown
+      const inboxMd = buildInboxMarkdown(inbox, targetName);
+      fs.writeFileSync(path.join(outDir, "context-inbox.md"), inboxMd, "utf8");
+
+      console.log(`  ${pc.green("✓")} ${targetName}/.contextbridge/`);
+    }
+
+    console.log("");
+    output.success(`已推送 ${snapshot.messages.length} 条消息到 ${toPaths.length} 个服务`);
+    console.log("");
+    output.section("📋 任务ID", taskId);
+    console.log("");
+    output.title("💡 在目标服务中对 AI 说：");
+    console.log(pc.cyan(`   接入 ${taskId}`));
+    console.log("");
+
+    if (options.watch) {
+      // 持续同步模式
+      output.title(`👀 监听中 (每 ${options.intervalSec} 秒)`);
+      output.dim("按 Ctrl+C 停止");
+      console.log("");
+
+      let previousSignature = snapshot.sourceSignature;
+
+      const tick = (): void => {
+        try {
+          const newSnapshot = loadSourceSnapshot(fromPath, 16);
+          if (newSnapshot.sourceSignature === previousSignature) {
+            return;
+          }
+
+          const watchTaskId = generateTaskId();
+
+          for (const targetPath of toPaths) {
+            const targetService = registry.services.find((s) => s.path === targetPath);
+            const targetName = targetService?.name ?? path.basename(targetPath);
+            const outDir = path.join(targetPath, ".contextbridge");
+
+            const result = writeSummaryFiles({
+              sourceProject: fromPath,
+              targetProject: targetPath,
+              snapshot: newSnapshot,
+              maxMessages: 16,
+              outputFormat: "both",
+              metadata: { taskId: watchTaskId, services: [], apiInterfaces: [], risks: [] },
+            });
+
+            // 更新收件箱（去重）
+            const inbox = readInbox(targetPath);
+            const now = new Date().toISOString();
+            const stamp = formatDate(new Date());
+            const archiveFile = result.generatedPaths.find((p) => p.includes(stamp)) ?? result.generatedPaths[0] ?? "";
+
+            // 移除已存在的相同 taskId
+            inbox.entries = inbox.entries.filter((e) => e.taskId !== watchTaskId);
+            inbox.entries.unshift({
+              taskId: watchTaskId,
+              receivedAt: now,
+              sourceProject: fromPath,
+              sourceServiceName: currentServiceName,
+              messageCount: newSnapshot.messages.length,
+              targetServices: targetNames,
+              summaryFile: path.join(targetPath, ".contextbridge", "context-summary-latest.md"),
+              archiveFile,
+            });
+            inbox.entries = inbox.entries.slice(0, 50);
+            writeInbox(targetPath, inbox);
+
+            const inboxMd = buildInboxMarkdown(inbox, targetName);
+            fs.writeFileSync(path.join(outDir, "context-inbox.md"), inboxMd, "utf8");
+          }
+
+          previousSignature = newSnapshot.sourceSignature;
+          console.log(`[${new Date().toLocaleTimeString()}] ${pc.green("✓")} 已推送 ${newSnapshot.messages.length} 条消息 (任务ID: ${watchTaskId})`);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(`[${new Date().toLocaleTimeString()}] ${pc.red("✗")} ${message}`);
+        }
+      };
+
+      setInterval(tick, options.intervalSec * 1000);
+    } else {
+      output.title("💡 下一步");
+      console.log("  在目标项目 Cursor 中打开:");
+      console.log(pc.dim("    .contextbridge/context-summary-latest.md"));
+      console.log("");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    printErrorWithRecovery(message, [
+      "确保已在 Cursor 中打开当前项目",
+      "进行至少一次对话",
+      "运行 `cb doctor` 检查环境",
+    ]);
+    process.exit(1);
+  }
+}
 
 function runSync(options: SyncOptions): void {
   try {
@@ -1004,13 +1492,33 @@ function runServicesImport(options: { root: string; dryRun: boolean }): void {
 
   if (!options.dryRun) {
     writeServiceRegistry(registry);
-  }
 
-  console.log(options.dryRun ? "Services import preview completed." : "Services import completed.");
-  console.log(`Root: ${options.root}`);
-  console.log(`Detected folders: ${entries.length}`);
-  console.log(`Added: ${added}, Updated: ${updated}, Skipped: ${skipped}`);
-  console.log(`Registry: ${resolveServiceRegistryPath()}`);
+    // 为每个服务生成 .cursorrules 文件
+    const cursorrulesContent = buildCursorrulesContent(registry.services);
+    let cursorrulesGenerated = 0;
+    for (const svc of registry.services) {
+      const cursorrulesPath = path.join(svc.path, ".cursorrules");
+      try {
+        fs.writeFileSync(cursorrulesPath, cursorrulesContent, "utf8");
+        cursorrulesGenerated += 1;
+      } catch {
+        // 忽略写入失败的情况（可能是权限问题）
+      }
+    }
+
+    console.log(options.dryRun ? "Services import preview completed." : "Services import completed.");
+    console.log(`Root: ${options.root}`);
+    console.log(`Detected folders: ${entries.length}`);
+    console.log(`Added: ${added}, Updated: ${updated}, Skipped: ${skipped}`);
+    console.log(`Registry: ${resolveServiceRegistryPath()}`);
+    console.log(`Generated .cursorrules: ${cursorrulesGenerated} files`);
+  } else {
+    console.log(options.dryRun ? "Services import preview completed." : "Services import completed.");
+    console.log(`Root: ${options.root}`);
+    console.log(`Detected folders: ${entries.length}`);
+    console.log(`Added: ${added}, Updated: ${updated}, Skipped: ${skipped}`);
+    console.log(`Registry: ${resolveServiceRegistryPath()}`);
+  }
 }
 
 function runServicesList(): void {
@@ -1025,6 +1533,26 @@ function runServicesList(): void {
   for (const svc of registry.services) {
     console.log(`- ${svc.name}: ${svc.path}`);
   }
+}
+
+function runServicesRemove(name: string): void {
+  const registry = readServiceRegistry();
+  const index = registry.services.findIndex((s) => s.name === name);
+
+  if (index === -1) {
+    output.error(`Service not found: ${name}`);
+    console.log("Run `cb services-list` to see all registered services.");
+    return;
+  }
+
+  const removed = registry.services.splice(index, 1)[0];
+  writeServiceRegistry(registry);
+
+  console.log("");
+  output.success(`Removed service: ${removed.name}`);
+  console.log(`Path: ${removed.path}`);
+  console.log("");
+  output.dim(`Registry: ${resolveServiceRegistryPath()}`);
 }
 
 function runTaskStart(options: {
@@ -1362,7 +1890,20 @@ async function runQuickstart(): Promise<void> {
   }
 }
 
-function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSnapshot {
+function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSnapshot & { sessionId?: string } {
+  // 优先从 SQLite 数据库读取对话记录
+  const acpResult = loadMessagesFromAcpSessions(projectPath, maxMessages);
+  if (acpResult.messages.length > 0) {
+    return {
+      sourceType: "acp-session",
+      sourceFile: "acp-sessions/store.db",
+      sourceSignature: `acp-session:${acpResult.sessionId}:${Date.now()}`,
+      messages: acpResult.messages,
+      sessionId: acpResult.sessionId,
+    };
+  }
+
+  // 其次尝试 transcript 文件
   const transcriptDir = resolveTranscriptDir(projectPath);
   const latestTranscript = pickLatestTranscriptFile(transcriptDir);
   if (latestTranscript) {
@@ -1378,6 +1919,7 @@ function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSna
     }
   }
 
+  // 最后尝试 worker.log
   const workerLogFile = resolveWorkerLogFile(projectPath);
   if (workerLogFile && fs.existsSync(workerLogFile)) {
     const workerMessages = parseWorkerLog(workerLogFile, maxMessages * 3);
@@ -1393,8 +1935,161 @@ function loadSourceSnapshot(projectPath: string, maxMessages: number): SourceSna
   }
 
   throw new Error(
-    `No readable source found. Tried transcript dir: ${transcriptDir}, worker log: ${workerLogFile ?? "N/A"}`,
+    `No readable source found for project: ${projectPath}`,
   );
+}
+
+function loadMessagesFromAcpSessions(projectPath: string, maxMessages: number): { messages: ChatMessage[]; sessionId: string } {
+  const home = getUserHomeDir();
+  const acpSessionsDir = path.join(home, ".cursor", "acp-sessions");
+
+  if (!fs.existsSync(acpSessionsDir)) {
+    return { messages: [], sessionId: "" };
+  }
+
+  const normalizedProjectPath = normalizeWorkspacePath(projectPath);
+
+  // 遍历所有 session 目录，找到最近活跃的匹配项目
+  const sessionDirs = fs.readdirSync(acpSessionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const sessionPath = path.join(acpSessionsDir, entry.name);
+      const metaPath = path.join(sessionPath, "meta.json");
+      let cwd = "";
+      let title = "";
+
+      // 读取 meta.json 获取项目路径
+      if (fs.existsSync(metaPath)) {
+        try {
+          const raw = fs.readFileSync(metaPath, "utf8");
+          const meta = JSON.parse(raw) as { cwd?: string; title?: string };
+          cwd = meta.cwd || "";
+          title = meta.title || "";
+        } catch {
+          // 忽略解析错误
+        }
+      }
+
+      return {
+        name: entry.name,
+        path: sessionPath,
+        cwd,
+        title,
+        mtime: fs.statSync(sessionPath).mtimeMs,
+      };
+    })
+    .sort((a, b) => b.mtime - a.mtime); // 按修改时间降序
+
+  // 找到匹配当前项目的 session
+  const matchingSession = sessionDirs.find((session) => {
+    if (!session.cwd) return false;
+    const normalizedCwd = normalizeWorkspacePath(session.cwd);
+    return (
+      normalizedCwd === normalizedProjectPath ||
+      session.cwd.replace(/\\/g, "/") === normalizedProjectPath
+    );
+  });
+
+  if (!matchingSession) {
+    return { messages: [], sessionId: "" };
+  }
+
+  const messages: ChatMessage[] = [];
+  const dbPath = path.join(matchingSession.path, "store.db");
+
+  if (!fs.existsSync(dbPath)) {
+    return { messages: [], sessionId: matchingSession.name };
+  }
+
+  let db: ReturnType<typeof Database> | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const rows = db.prepare("SELECT data FROM blobs").all() as { data: Buffer }[];
+
+    for (const row of rows) {
+      try {
+        const text = row.data.toString("utf8");
+        const parsed = JSON.parse(text) as unknown;
+
+        if (!parsed || typeof parsed !== "object") continue;
+
+        const obj = parsed as Record<string, unknown>;
+        const role = typeof obj.role === "string" ? obj.role : "unknown";
+
+        // 跳过系统消息
+        if (role === "system") continue;
+
+        let content = "";
+
+        if (typeof obj.content === "string") {
+          content = obj.content;
+        } else if (Array.isArray(obj.content)) {
+          content = obj.content
+            .filter((item): item is { type: string; text: string } =>
+              typeof item === "object" && item !== null && item.type === "text"
+            )
+            .map((item) => item.text)
+            .join("\n");
+        }
+
+        if (content && content.trim()) {
+          // 提取用户问题（从 <user_query> 标签）
+          const queryMatch = content.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
+          if (queryMatch) {
+            content = queryMatch[1].trim();
+          }
+
+          // 过滤掉纯系统信息和噪音
+          if (
+            content.startsWith("<user_info>") ||
+            content.startsWith("<timestamp>") ||
+            content.startsWith("<git_status>") ||
+            content.includes("Workspace Path:")
+          ) {
+            continue;
+          }
+
+          messages.push({
+            role: role as ChatRole,
+            text: normalizeWhitespace(content),
+          });
+        }
+      } catch (e) {
+        // 忽略解析错误
+      }
+    }
+  } finally {
+    // 确保数据库连接关闭
+    if (db) {
+      try {
+        db.close();
+      } catch (e) {
+        // 忽略关闭错误
+      }
+    }
+  }
+
+  // 去重并取最近的 N 条
+  const seen = new Set<string>();
+  const uniqueMessages: ChatMessage[] = [];
+
+  // 使用 reversed 避免修改原数组
+const reversedMessages = [...messages].reverse();
+for (const msg of reversedMessages) {
+  const key = msg.text.substring(0, 100);
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniqueMessages.push({ role: msg.role, text: msg.text });
+    }
+  }
+
+  // 生成短格式的 session id（取前 8 位）
+  const shortSessionId = matchingSession.name.substring(0, 8).toUpperCase();
+
+  return {
+    messages: uniqueMessages.slice(-maxMessages),
+    sessionId: `TASK-${shortSessionId}`,
+  };
 }
 
 function loadSourceSnapshotByMarker(
@@ -1755,63 +2450,102 @@ function extractText(value: unknown): string {
 function buildSummary(input: {
   sourceProject: string;
   sourceFile: string;
-  sourceType: "transcript" | "worker-log";
+  sourceType: "acp-session" | "transcript" | "worker-log";
   allMessages: ChatMessage[];
   maxMessages: number;
   metadata: SyncMetadata;
 }): string {
   const recent = input.allMessages.slice(-Math.max(input.maxMessages, 1));
-  const users = dedupeLines(
-    recent.filter((m) => m.role === "user").map((m) => pickFirstLine(m.text)),
-  );
-  const assistants = dedupeLines(
-    recent
-      .filter((m) => m.role === "assistant")
-      .map((m) => pickFirstLine(m.text)),
-  );
 
-  const userSection = toBulletLines(users, 5);
-  const assistantSection = toBulletLines(assistants, 5);
-  const decisionSection = toBulletLines(assistants, 3);
-  const nextStepSection = buildNextSteps(users, assistants);
-  const metadataSection = buildMetadataLines(input.metadata);
+  // 分离用户问题和 AI 回答
+  const userQuestions = recent
+    .filter((m) => m.role === "user")
+    .map((m) => {
+      const text = m.text.trim();
+      // 过滤掉噪音
+      if (text.length < 5) return null;
+      if (text.includes("<user_info>")) return null;
+      return text.length > 200 ? text.substring(0, 200) + "..." : text;
+    })
+    .filter((m): m is string => m !== null);
 
-  return [
+  const aiResponses = recent
+    .filter((m) => m.role === "assistant")
+    .map((m) => {
+      const text = m.text.trim();
+      if (text.length < 10) return null;
+
+      // 优先提取有结论性的内容
+      const conclusionPatterns = [
+        /(?:建议|推荐|方案|结论|决定|最终)[：:]\s*(.{20,200})/,
+        /(?:最佳方案是|我建议|推荐方案)[：:]?\s*(.{20,200})/,
+        /(?:实现步骤|具体步骤)[：:]\s*(.{20,200})/,
+      ];
+
+      for (const pattern of conclusionPatterns) {
+        const match = text.match(pattern);
+        if (match) {
+          return match[1].trim();
+        }
+      }
+
+      // 过滤过程性描述
+      if (
+        text.startsWith("我先") ||
+        text.startsWith("让我") ||
+        text.startsWith("正在") ||
+        text.startsWith("我来查") ||
+        text.includes("让我看一下") ||
+        text.includes("我先看一下")
+      ) {
+        return null;
+      }
+
+      return text.length > 300 ? text.substring(0, 300) + "..." : text;
+    })
+    .filter((m): m is string => m !== null);
+
+  // 构建摘要
+  const lines: string[] = [
     "# ContextBridge 同步摘要",
     "",
+    `- 任务ID: \`${input.metadata.taskId}\``,
     `- 同步时间: ${new Date().toLocaleString()}`,
-    `- 源项目: \`${input.sourceProject}\``,
-    `- 数据来源: \`${input.sourceType}\``,
-    `- 源文件: \`${input.sourceFile}\``,
-    ...metadataSection,
+    `- 源项目: \`${path.basename(input.sourceProject)}\``,
+  ];
+
+  // 用户问题部分
+  if (userQuestions.length > 0) {
+    lines.push("", "## 用户问题");
+    const uniqueQuestions = [...new Set(userQuestions)].slice(-3);
+    for (const q of uniqueQuestions) {
+      lines.push(`- ${q}`);
+    }
+  }
+
+  // AI 回答部分
+  if (aiResponses.length > 0) {
+    lines.push("", "## AI 回答要点");
+    const uniqueResponses = [...new Set(aiResponses)].slice(-5);
+    for (const r of uniqueResponses) {
+      lines.push(`- ${r}`);
+    }
+  }
+
+  // 使用建议
+  lines.push(
     "",
-    ...(users.length > 0
-      ? [
-          "## 任务目标",
-          userSection,
-          "",
-          "## 关键决策",
-          decisionSection,
-          "",
-          "## 执行记录",
-          assistantSection,
-        ]
-      : ["## 执行记录", assistantSection]),
-    "",
-    "## 下一步建议",
-    nextStepSection,
-    "",
-    "## 使用建议",
-    "- 在 Cursor 中打开本文件，并在新会话开头引用其中要点。",
-    "- 对当前任务补充任务 ID、接口名、验收标准后再继续协作。",
-    "",
-  ].join("\n");
+    "---",
+    `💡 在目标服务中对 Cursor说: \`接入 ${input.metadata.taskId}\``,
+  );
+
+  return lines.join("\n");
 }
 
 function buildJsonSummary(input: {
   sourceProject: string;
   sourceFile: string;
-  sourceType: "transcript" | "worker-log";
+  sourceType: "acp-session" | "transcript" | "worker-log";
   allMessages: ChatMessage[];
   maxMessages: number;
   metadata: SyncMetadata;
@@ -2100,9 +2834,7 @@ function formatDate(date: Date): string {
 
 function buildMetadataLines(metadata: SyncMetadata): string[] {
   const lines: string[] = [];
-  if (metadata.taskId) {
-    lines.push(`- 任务ID: \`${metadata.taskId}\``);
-  }
+  // taskId 已在摘要头部显示，这里不再重复
   if (metadata.services.length > 0) {
     lines.push(`- 关联服务: ${metadata.services.join(", ")}`);
   }
@@ -2236,6 +2968,106 @@ function buildExportMarkdown(data: {
     }
     lines.push("");
   }
+
+  return lines.join("\n");
+}
+
+function resolveInboxPath(targetProject: string): string {
+  return path.join(targetProject, ".contextbridge", "context-inbox.json");
+}
+
+function readInbox(targetProject: string): InboxState {
+  const inboxPath = resolveInboxPath(targetProject);
+  if (!fs.existsSync(inboxPath)) {
+    return { version: 1, entries: [] };
+  }
+
+  try {
+    const raw = fs.readFileSync(inboxPath, "utf8").replace(/^﻿/, "");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return { version: 1, entries: [] };
+    }
+    const obj = parsed as Record<string, unknown>;
+    const entriesRaw = Array.isArray(obj.entries) ? obj.entries : [];
+    const entries: InboxEntry[] = entriesRaw
+      .filter((item): item is InboxEntry => {
+        return (
+          item &&
+          typeof item === "object" &&
+          typeof item.taskId === "string" &&
+          typeof item.receivedAt === "string" &&
+          typeof item.sourceProject === "string" &&
+          typeof item.messageCount === "number" &&
+          typeof item.summaryFile === "string"
+        );
+      })
+      .slice(0, 50); // 保留最近50条
+    return { version: 1, entries };
+  } catch {
+    return { version: 1, entries: [] };
+  }
+}
+
+function writeInbox(targetProject: string, inbox: InboxState): void {
+  const inboxPath = resolveInboxPath(targetProject);
+  const dir = path.dirname(inboxPath);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(inboxPath, JSON.stringify(inbox, null, 2), "utf8");
+}
+
+function buildInboxMarkdown(inbox: InboxState, currentServiceName: string): string {
+  const lines: string[] = [];
+  lines.push("# 📬 ContextBridge 收件箱");
+  lines.push("");
+  lines.push(`当前项目: **${currentServiceName}**`);
+  lines.push("");
+
+  if (inbox.entries.length === 0) {
+    lines.push("暂无收到的上下文。");
+    lines.push("");
+    lines.push("---");
+    lines.push("💡 在源服务中说 `同步到 " + currentServiceName + "` 即可推送上下文");
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  const latest = inbox.entries[0];
+
+  lines.push("## 最新收件");
+  lines.push("");
+  lines.push(`| 任务ID | 来源 | 消息数 | 时间 |`);
+  lines.push(`|--------|------|--------|------|`);
+  lines.push(
+    `| \`${latest.taskId}\` | ${latest.sourceServiceName} | ${latest.messageCount} 条 | ${formatTimestamp(latest.receivedAt)} |`
+  );
+  lines.push("");
+
+  // 简化的使用说明
+  lines.push("### 接入方式");
+  lines.push("对 Cursor 说：");
+  lines.push("```");
+  lines.push(`接入 ${latest.taskId}`);
+  lines.push("```");
+  lines.push("");
+
+  // 历史记录
+  if (inbox.entries.length > 1) {
+    lines.push("## 历史收件");
+    lines.push("");
+    lines.push(`| 任务ID | 来源 | 消息数 | 时间 |`);
+    lines.push(`|--------|------|--------|------|`);
+    for (const entry of inbox.entries.slice(1, 6)) {
+      lines.push(
+        `| \`${entry.taskId}\` | ${entry.sourceServiceName} | ${entry.messageCount} 条 | ${formatTimestamp(entry.receivedAt)} |`
+      );
+    }
+    lines.push("");
+  }
+
+  lines.push("---");
+  lines.push(`_最后更新: ${new Date().toLocaleString()}_`);
+  lines.push("");
 
   return lines.join("\n");
 }
@@ -2407,6 +3239,35 @@ function generateTaskId(): string {
   const hh = String(now.getHours()).padStart(2, "0");
   const mi = String(now.getMinutes()).padStart(2, "0");
   return `TASK-${yyyy}${mm}${dd}-${hh}${mi}`;
+}
+
+function buildCursorrulesContent(services: ServiceEntry[]): string {
+  const serviceNames = services.map((s) => s.name);
+  const lines: string[] = [
+    "# ContextBridge Rules",
+    "",
+    "## 源服务：同步上下文",
+    "When user says \"sync to xxx\" or \"同步到 xxx\":",
+    "1. Run: cb push xxx",
+    "2. Tell user the task ID",
+    "",
+    "## 目标服务：接入上下文",
+    "When user says \"接入 TASK-xxx\" or \"接入 xxx\":",
+    "1. Read .contextbridge/context-summary-latest.md",
+    "2. Summarize: \"收到来自 [源项目] 的上下文\"",
+    "3. List the user questions from the summary",
+    "4. Ask: \"需要我继续推进这个任务吗？\"",
+    "",
+    "## 收件箱",
+    "Check .contextbridge/context-inbox.md for all received contexts",
+    "",
+    "## Available services:",
+  ];
+  for (const name of serviceNames) {
+    lines.push(`- ${name}`);
+  }
+  lines.push("");
+  return lines.join("\n");
 }
 
 function writeSummaryFiles(input: {

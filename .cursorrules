@@ -1,0 +1,46 @@
+# ContextBridge Rules
+
+## 源服务：同步上下文
+When user says "sync to xxx" or "同步到 xxx":
+1. Run: cb push xxx
+2. Tell user the task ID
+
+## 目标服务：接入上下文
+When user says "接入 TASK-xxx" or "接入 xxx":
+1. Read .contextbridge/context-summary-latest.md
+2. Summarize: "收到来自 [源项目] 的上下文"
+3. List the user questions from the summary
+4. Ask: "需要我继续推进这个任务吗？"
+
+## 收件箱
+Check .contextbridge/context-inbox.md for all received contexts
+
+## Available services:
+- ai-test
+- ai-test-re
+- cc
+- context-bridge-cli
+- weekly-report
+- yl-jms-app-api
+- yl-jms-app-bc
+- yl-jms-app-bc-inner
+- yl-jms-operatreport-api
+- yl-jms-ops-api
+- yl-jms-ops-app-core
+- yl-jms-ops-async
+- yl-jms-ops-hbase-biz-read-api
+- yl-jms-ops-inner-read-api
+- yl-jms-ops-inner-write-api
+- yl-jms-ops-intervene-center
+- yl-jms-ops-intervene-data-api
+- yl-jms-ops-outer-ai
+- yl-jms-ops-report-api
+- yl-jms-ops-scan-upload-api
+- yl-jms-ops-scan-upload-web
+- yl-jms-ops-volcano-handle-api
+- yl-jms-ops-write-api
+- yl-jms-ops-ztapp-api
+- yl-nwm-transfer-outer-api
+- yl-ops-bigdata-interactive-api
+- yl-web-operatingplatform
+- yl-web-operatingplatform-bigdata
